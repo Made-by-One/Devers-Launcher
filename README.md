@@ -5,7 +5,7 @@ A modern, minimal game launcher for `.dvp` files — created by [Devers Packer](
 ![Platform](https://img.shields.io/badge/platform-Windows-white)
 [![Release](https://img.shields.io/badge/release-v1.1-white)](https://github.com/Made-by-One/Devers-Launcher/releases)
 [![License](https://img.shields.io/badge/license-MIT-lightgrey)](LICENSE)
-[![Made by](https://img.shields.io/badge/Made%20by%20One%20Studio-black)](#)
+[![Made by](https://img.shields.io/badge/Made%20by%20One%20Studio-black)](https://made-by-one.github.io/)
 
 
 ---
