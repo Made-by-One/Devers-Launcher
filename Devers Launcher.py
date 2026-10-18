@@ -1,4 +1,4 @@
-VERSION = "1.2"
+VERSION = "1.3"
 
 import sys
 import os
@@ -9,6 +9,13 @@ import subprocess
 import tempfile
 import time
 import logging
+import hashlib
+import re
+import threading
+import webbrowser
+import urllib.request
+import urllib.error
+from collections import OrderedDict
 from pathlib import Path
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                              QHBoxLayout, QLabel, QPushButton, QFrame,
@@ -38,9 +45,12 @@ ICON_DIR          = DATA_DIR / "icon"
 GAMES_DIR         = DATA_DIR / "games"
 SAVE_DIR          = DATA_DIR / "save"
 CACHE_DIR         = SAVE_DIR / "cache"
+COVERS_DIR        = CACHE_DIR / "covers"
+UPDATES_DIR       = SAVE_DIR / "updates"
 
 CONFIG_FILE       = SAVE_DIR / "devers_config.json"
 CACHE_FILE        = SAVE_DIR / "cache.json"
+LIBRARY_FILE      = SAVE_DIR / "library.json"
 STATS_FILE        = SAVE_DIR / "stats.json"
 LOG_FILE          = SAVE_DIR / "launcher.log"
 
@@ -50,6 +60,7 @@ ICONS_DIR         = ICON_DIR
 
 CONFIG_PATH      = str(CONFIG_FILE)
 CACHE_PATH       = str(CACHE_FILE)
+LIBRARY_PATH     = str(LIBRARY_FILE)
 STATS_PATH       = str(STATS_FILE)
 LOG_PATH         = str(LOG_FILE)
 GIF_PATH_S       = str(GIF_PATH)
@@ -61,7 +72,7 @@ LOCALIZATION_DIR_S = str(LOCALIZATION_DIR)
 def ensure_dirs() -> None:
     """Создаёт всю структуру data/ при старте."""
     for d in (DATA_DIR, LOCALIZATION_DIR, ICON_DIR,
-              GAMES_DIR, SAVE_DIR, CACHE_DIR):
+              GAMES_DIR, SAVE_DIR, CACHE_DIR, COVERS_DIR, UPDATES_DIR):
         d.mkdir(parents=True, exist_ok=True)
 
 
@@ -70,6 +81,7 @@ def migrate_legacy() -> None:
     legacy_files = {
         BASE_DIR / "devers_config.json": CONFIG_FILE,
         BASE_DIR / "cache.json":         CACHE_FILE,
+        BASE_DIR / "library.json":       LIBRARY_FILE,
         BASE_DIR / "stats.json":         STATS_FILE,
         BASE_DIR / "launcher.log":       LOG_FILE,
     }
@@ -146,8 +158,26 @@ DEFAULT_CONFIG = {
     "sidebar_collapsed": False,
     "favorites": [],
     "sort_mode": "name",
-    "language": "en"
+    "language": "en",
+    "check_updates": True,
+    "last_update_check": 0,
+    "auto_steam_import": True,
+    "steam_path": "",
+    "steam_hidden": [],
+    "steam_import_done": False,
 }
+
+ARCHIVE_EXTENSIONS = (".dvp", ".zip")
+DIRECT_EXTENSIONS  = (".exe", ".bat", ".cmd", ".lnk", ".url")
+SUPPORTED_EXTENSIONS = ARCHIVE_EXTENSIONS + DIRECT_EXTENSIONS
+
+GITHUB_REPO        = "Made-by-One/Devers-Launcher"
+GITHUB_RELEASES_API = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
+GITHUB_RELEASES_PAGE = f"https://github.com/{GITHUB_REPO}/releases"
+UPDATE_CHECK_INTERVAL = 6 * 60 * 60
+USER_AGENT = f"DeversLauncher/{VERSION}"
+
+STEAM_CDN_HEADER = "https://cdn.cloudflare.steamstatic.com/steam/apps/{appid}/header.jpg"
 
 
 logging.basicConfig(
@@ -170,7 +200,7 @@ EN_DEFAULT = {
 
     "app.title": "Devers Launcher",
     "app.subtitle": f"VERSION {VERSION}",
-    "app.description": "Light game launcher for .dvp format.\nExtracts and runs games right from the launcher,\nwithout leaving any junk on your disk.",
+    "app.description": "Light game launcher for .dvp, .zip and .exe games.\nExtracts and runs games right from the launcher,\nautomatically picks up your Steam library.\nNo junk left on your disk.",
     "app.footer": "© 2026 Made by One Studio  •  All games are stored locally",
 
     "sidebar.home": "Home",
@@ -188,9 +218,13 @@ EN_DEFAULT = {
     "library.sort.date": "By date",
     "library.sort.time": "By playtime",
     "library.sort.favorites": "Favorites first",
-    "library.empty": "Library is empty.\nDrag .dvp files into the window or place them into 'data/games' folder.",
+    "library.empty": "Library is empty.\nDrag .dvp, .zip, .exe files, shortcuts or folders into the window,\nor add them with the 'Add game' button.",
     "library.found": "Found games: {count}",
     "library.not_played": "not played yet",
+    "library.add_game": "Add game",
+    "library.add_folder": "Add folder",
+    "library.steam": "Steam",
+    "library.added": "Added games: {count}",
 
     "card.error": "ERROR",
     "card.no_cover": "NO COVER",
@@ -202,6 +236,7 @@ EN_DEFAULT = {
     "menu.favorite_add": "Add to favorites",
     "menu.favorite_remove": "Remove from favorites",
     "menu.open_folder": "Open game folder",
+    "menu.remove": "Remove from library",
     "menu.rename": "Rename",
     "menu.delete": "Delete",
     "menu.separator": "",
@@ -211,6 +246,14 @@ EN_DEFAULT = {
     "dialog.delete.title": "Delete",
     "dialog.delete.confirm": "Delete '{name}'?",
     "dialog.delete.error": "Failed to delete: {error}",
+    "dialog.remove.title": "Remove from library",
+    "dialog.remove.confirm": "Remove '{name}' from the library?\nThe game files will not be deleted.",
+    "dialog.add.title": "Add games",
+    "dialog.add.filter": "Games (*.dvp *.zip *.exe *.bat *.cmd *.lnk *.url);;All files (*)",
+    "dialog.add.none": "No supported files selected.",
+    "dialog.add.error": "Could not add the game: {error}",
+    "dialog.add.exists": "'{name}' is already in the library.",
+    "dialog.folder.title": "Select game folder",
 
     "launch.extracting": "Extracting «{name}»...",
     "launch.extract_error": "Extraction error",
@@ -221,6 +264,11 @@ EN_DEFAULT = {
     "launch.closed": "Game closed. Cleaning up...",
     "launch.cleaned": "Cleaned",
     "launch.corrupted": "Game is corrupted:\n{error}",
+    "launch.no_exe": "No executable file found inside «{name}»",
+    "launch.steam_launch": "Launching «{name}» via Steam...",
+    "launch.steam_error": "Could not launch via Steam: {error}",
+    "launch.direct": "▶  {name} launched",
+    "launch.missing_path": "Game files not found:\n{path}",
 
     "settings.title": "Settings",
     "settings.subtitle": "Manage storage and launcher behavior",
@@ -228,6 +276,9 @@ EN_DEFAULT = {
     "settings.section.temp": "TEMPORARY FILES",
     "settings.section.interface": "INTERFACE",
     "settings.section.language": "LANGUAGE",
+    "settings.section.steam": "STEAM",
+    "settings.section.updates": "UPDATES",
+    "settings.section.cache": "IMAGE CACHE",
     "settings.games_dir": "Games folder:",
     "settings.temp_info": "Folder: {path}\nUsed: {size}",
     "settings.open_folder": "Open folder",
@@ -235,6 +286,14 @@ EN_DEFAULT = {
     "settings.auto_cleanup": "Automatically clean temp files",
     "settings.show_ext": "Show file extensions",
     "settings.start_collapsed": "Start with collapsed sidebar",
+    "settings.auto_steam": "Automatically add installed Steam games",
+    "settings.steam_path": "Steam folder:",
+    "settings.steam_missing": "Steam was not detected automatically",
+    "settings.check_updates": "Check for updates automatically",
+    "settings.check_now": "Check now",
+    "settings.covers_info": "Cached covers: {count}  •  {size}",
+    "settings.clear_covers": "Clear cache",
+    "settings.covers_cleared": "Image cache cleared.",
     "settings.language": "Language:",
     "settings.save": "Save",
     "settings.cancel": "Cancel",
@@ -247,11 +306,60 @@ EN_DEFAULT = {
 
     "about.title": "About",
     "about.version": f"VERSION {VERSION}",
-    "about.description": "Light game launcher for .dvp format.\n\nDeveloped by Made by One Studio.\nPacks, extracts and runs games,\nwithout leaving any junk on your disk.",
+    "about.description": "Light game launcher for .dvp, .zip and .exe games.\n\nDeveloped by Made by One Studio.\nPacks, extracts and runs games, imports your Steam library\nand keeps everything local on your disk.",
     "about.close": "Close",
+    "about.check_updates": "Check for updates",
+
+    "steam.title": "Import from Steam",
+    "steam.subtitle": "Installed Steam games",
+    "steam.selection_hint": "Check the games that should be in the launcher",
+    "steam.apply_selection": "Apply selection ({count})",
+    "steam.selection_applied": "Steam library updated: +{added}, −{removed}",
+    "steam.search_placeholder": "Search Steam games...",
+    "steam.select_all": "Select all",
+    "steam.select_none": "Clear",
+    "steam.add_selected": "Add selected ({count})",
+    "steam.not_found": "Steam installation was not found.\nSet the Steam folder in Settings.",
+    "steam.empty": "No installed Steam games found.",
+    "steam.already_added": "in library",
+    "steam.scanning": "Scanning Steam library...",
+    "steam.added": "Games added from Steam: {count}",
+    "steam.found": "Found installed games: {count}",
+    "steam.path": "Steam folder: {path}",
+
+    "update.title": "Update available",
+    "update.found": "Devers Launcher {version} is available.\nYou have version {current}.",
+    "update.notes": "What's new:",
+    "update.download": "Download & install",
+    "update.downloading": "Downloading update... {percent}%",
+    "update.download_error": "Update download failed:\n{error}",
+    "update.page": "Release page",
+    "update.later": "Later",
+    "update.ready": "The update is downloaded. The launcher will close and restart to finish installing.",
+    "update.apply_error": "Could not start the installer:\n{error}",
+    "update.up_to_date": "You have the latest version ({version}).",
+    "update.check_failed": "Could not check for updates:\n{error}",
+    "update.checking": "Checking for updates...",
+    "update.check_title": "Checking for updates",
+    "update.checking_hint": "Looking for a new version on GitHub...",
+    "update.check_hint": "Check your internet connection or open the release page.",
+    "update.up_to_date_title": "You're up to date",
+    "update.current_version": "Installed version: {version}",
+    "update.retry": "Check again",
+    "update.close": "Close",
+    "update.error_title": "Update check failed",
+    "update.asset": "{name}  •  {size}",
+    "update.source_hint": "Running from source: the update will be saved to the updates folder.",
+    "update.chip": "Update {version} — download",
+    "update.source_mode": "This build runs from source, so it cannot replace itself.\nThe update was saved to:\n{path}",
+    "update.no_asset": "This release has no downloadable build for your system.",
+    "update.tray_title": "Update available",
+    "update.tray_msg": "Devers Launcher {version} is available",
 
     "tray.show": "Show",
     "tray.quit": "Quit",
+    "tray.check_updates": "Check for updates",
+    "tray.settings": "Settings",
     "tray.minimized_title": "Devers Launcher",
     "tray.minimized_msg": "Minimized to tray",
 
@@ -509,6 +617,480 @@ def get_icon_tinted(name, size, color):
     return icon
 
 
+# ---------------------------------------------------------------------------
+#  IMAGE CACHE
+#  Covers are cached on disk (data/save/cache/covers) and in memory, so they
+#  are decoded/downloaded only once and survive launcher restarts.
+# ---------------------------------------------------------------------------
+
+COVER_MEMORY_LIMIT = 120
+COVER_MEMORY_MAX_SIDE = 480
+_cover_memory = OrderedDict()
+_cover_memory_lock = threading.Lock()
+_cover_failures = set()
+
+
+def _cover_hash(source: str) -> str:
+    return hashlib.sha1(source.encode("utf-8", "ignore")).hexdigest()
+
+
+def _cover_cache_file(source: str) -> Path:
+    return COVERS_DIR / f"{_cover_hash(source)}.img"
+
+
+def store_cover_bytes(source: str, data: bytes) -> str:
+    """Saves raw image bytes and returns the cached file path ("" on error)."""
+    if not data:
+        return ""
+    path = _cover_cache_file(source)
+    try:
+        if path.exists() and path.stat().st_size == len(data):
+            return str(path)
+        COVERS_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(path.name + ".tmp")
+        with open(tmp, "wb") as f:
+            f.write(data)
+        os.replace(tmp, path)
+        return str(path)
+    except Exception as e:
+        log.warning(f"Не удалось сохранить обложку в кеш: {e}")
+        return ""
+
+
+def _cover_url_candidates(url: str):
+    """Steam header images do not exist for every app, so try other assets."""
+    yield url
+    match = re.search(r"/steam/apps/(\d+)/header\.jpg$", url)
+    if match:
+        appid = match.group(1)
+        for name in ("library_600x900.jpg", "capsule_616x353.jpg",
+                     "capsule_231x87.jpg", "logo.png"):
+            yield f"https://shared.steamstatic.com/store_item_assets/steam/apps/{appid}/{name}"
+
+
+def download_cover(url: str) -> str:
+    """Downloads a remote cover once and stores it on disk."""
+    path = _cover_cache_file(url)
+    try:
+        if path.exists() and path.stat().st_size > 0:
+            return str(path)
+    except OSError:
+        pass
+    if url in _cover_failures:
+        return ""
+
+    for candidate in _cover_url_candidates(url):
+        try:
+            req = urllib.request.Request(candidate, headers={"User-Agent": USER_AGENT})
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                data = resp.read()
+            if not data:
+                continue
+            saved = store_cover_bytes(url, data)
+            if saved:
+                log.info(f"Обложка загружена и закеширована: {candidate}")
+                return saved
+        except Exception as e:
+            log.warning(f"Не удалось скачать обложку {candidate}: {e}")
+
+    _cover_failures.add(url)
+    return ""
+
+
+def _remember_cover(key: str, image: QImage):
+    with _cover_memory_lock:
+        _cover_memory[key] = image
+        _cover_memory.move_to_end(key)
+        while len(_cover_memory) > COVER_MEMORY_LIMIT:
+            _cover_memory.popitem(last=False)
+
+
+def load_cover_image(path: str = "", url: str = "", data: bytes = b"") -> QImage:
+    """Loads a cover from memory cache, disk, URL or raw bytes (thread-safe)."""
+    key = path or url or (_cover_hash(data) if data else "")
+    if not key:
+        return QImage()
+
+    with _cover_memory_lock:
+        if key in _cover_memory:
+            _cover_memory.move_to_end(key)
+            return _cover_memory[key]
+    if url and url in _cover_failures:
+        return QImage()
+
+    image = QImage()
+    try:
+        if data:
+            image.loadFromData(data)
+        else:
+            local = path
+            if url:
+                local = download_cover(url)
+                key = url
+            if local and os.path.exists(local):
+                image = QImage(local)
+    except Exception as e:
+        log.warning(f"Обложка не загрузилась ({key}): {e}")
+
+    if not image.isNull():
+        if max(image.width(), image.height()) > COVER_MEMORY_MAX_SIDE:
+            image = image.scaled(
+                COVER_MEMORY_MAX_SIDE, COVER_MEMORY_MAX_SIDE,
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+        _remember_cover(key, image)
+    return image
+
+
+def clear_cover_cache() -> None:
+    with _cover_memory_lock:
+        _cover_memory.clear()
+    _cover_failures.clear()
+    if COVERS_DIR.exists():
+        for item in COVERS_DIR.iterdir():
+            try:
+                if item.is_file():
+                    item.unlink()
+            except OSError:
+                pass
+
+
+def cover_cache_stats():
+    count = 0
+    size = 0
+    if COVERS_DIR.exists():
+        for item in COVERS_DIR.iterdir():
+            try:
+                if item.is_file():
+                    count += 1
+                    size += item.stat().st_size
+            except OSError:
+                pass
+    return count, size
+
+
+# ---------------------------------------------------------------------------
+#  GAME FILE HELPERS
+# ---------------------------------------------------------------------------
+
+EXE_BLACKLIST = (
+    "unins", "uninstall", "vcredist", "vc_redist", "dxsetup", "dxwebsetup",
+    "setup", "installer", "crash", "report", "unitycrashhandler",
+    "notification_helper", "touchup", "activate",
+)
+
+
+def prettify_name(stem: str) -> str:
+    name = re.sub(r"[._]+", " ", stem)
+    name = re.sub(r"\s{2,}", " ", name).strip()
+    return name or stem
+
+
+def _exe_score(name: str, size: int, depth: int) -> float:
+    low = os.path.basename(name).lower()
+    if not low.endswith(".exe"):
+        return -1
+    if any(bad in low for bad in EXE_BLACKLIST):
+        return -1
+    return size + max(0, 3 - depth) * 1_000_000
+
+
+def detect_executable(root) -> str:
+    """Finds the most likely game executable inside an extracted folder."""
+    best = None
+    root = str(root)
+    if not os.path.isdir(root):
+        return ""
+    for cur, dirs, files in os.walk(root):
+        rel = os.path.relpath(cur, root)
+        depth = 0 if rel == "." else len(Path(rel).parts)
+        if depth >= 3:
+            dirs[:] = []
+        for f in files:
+            if not f.lower().endswith(".exe"):
+                continue
+            full = os.path.join(cur, f)
+            try:
+                size = os.path.getsize(full)
+            except OSError:
+                size = 0
+            score = _exe_score(f, size, depth)
+            if score < 0:
+                continue
+            if best is None or score > best[0]:
+                best = (score, full)
+    return best[1] if best else ""
+
+
+def detect_exe_in_archive(zf) -> str:
+    """Finds the most likely game executable inside a zip/dvp archive."""
+    best = None
+    for info in zf.infolist():
+        if info.is_dir() or not info.filename.lower().endswith(".exe"):
+            continue
+        depth = info.filename.count("/")
+        score = _exe_score(info.filename, info.file_size, depth)
+        if score < 0:
+            continue
+        if best is None or score > best[0]:
+            best = (score, info.filename)
+    return best[1] if best else ""
+
+
+def find_cover_in_archive(zf):
+    """Returns (bytes, extension) of the first cover-like image in an archive."""
+    pattern = re.compile(r"(^|/)(cover|header|banner|poster|artwork)[^/]*\.(png|jpe?g|webp|bmp)$", re.I)
+    for info in zf.infolist():
+        if info.is_dir():
+            continue
+        if pattern.search(info.filename):
+            try:
+                if 0 < info.file_size <= 8 * 1024 * 1024:
+                    return zf.read(info.filename), os.path.splitext(info.filename)[1].lower()
+            except Exception:
+                continue
+    return None
+
+
+# ---------------------------------------------------------------------------
+#  STEAM LIBRARY
+# ---------------------------------------------------------------------------
+
+STEAM_TOOL_NAMES = (
+    "steamworks common redistributables",
+    "steam linux runtime",
+    "steamvr",
+    "proton",
+    "steam audio",
+)
+
+
+def find_steam_path(configured: str = ""):
+    candidates = []
+    if configured:
+        candidates.append(os.path.expandvars(configured))
+
+    if os.name == "nt":
+        try:
+            import winreg
+            for root, sub in (
+                (winreg.HKEY_CURRENT_USER, r"Software\Valve\Steam"),
+                (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\Valve\Steam"),
+                (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Valve\Steam"),
+            ):
+                try:
+                    with winreg.OpenKey(root, sub) as key:
+                        for value in ("SteamPath", "InstallPath"):
+                            try:
+                                val, _ = winreg.QueryValueEx(key, value)
+                                if val:
+                                    candidates.append(val)
+                            except OSError:
+                                pass
+                except OSError:
+                    pass
+        except ImportError:
+            pass
+        for env in ("ProgramFiles(x86)", "ProgramFiles"):
+            base = os.environ.get(env)
+            if base:
+                candidates.append(os.path.join(base, "Steam"))
+    elif sys.platform == "darwin":
+        candidates.append(os.path.expanduser("~/Library/Application Support/Steam"))
+    else:
+        candidates.extend(os.path.expanduser(p) for p in (
+            "~/.steam/steam", "~/.local/share/Steam",
+            "~/.var/app/com.valvesoftware.Steam/.local/share/Steam",
+        ))
+
+    for candidate in candidates:
+        try:
+            p = Path(candidate)
+            if p.is_dir():
+                return p
+        except OSError:
+            continue
+    return None
+
+
+def steam_library_folders(steam_path: Path) -> list:
+    folders = [steam_path]
+    vdf = steam_path / "steamapps" / "libraryfolders.vdf"
+    if vdf.exists():
+        try:
+            text = vdf.read_text(encoding="utf-8", errors="ignore")
+            for raw in re.findall(r'"path"\s+"([^"]+)"', text, flags=re.I):
+                path = Path(raw.replace("\\\\", "\\"))
+                if path.is_dir() and path not in folders:
+                    folders.append(path)
+        except Exception as e:
+            log.warning(f"Не удалось прочитать libraryfolders.vdf: {e}")
+    return folders
+
+
+def _parse_steam_acf(path: Path) -> dict:
+    data = {}
+    try:
+        text = path.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return data
+    for m in re.finditer(r'"([^"]+)"\s+"([^"]*)"', text):
+        data[m.group(1)] = m.group(2)
+    return data
+
+
+def scan_steam_games(steam_path):
+    """Returns a list of installed Steam games found in all library folders."""
+    if not steam_path:
+        return []
+    games = []
+    seen = set()
+    appcache = steam_path / "appcache" / "librarycache"
+
+    for library in steam_library_folders(steam_path):
+        steamapps = library / "steamapps"
+        if not steamapps.is_dir():
+            continue
+        try:
+            manifests = sorted(steamapps.glob("appmanifest_*.acf"))
+        except OSError:
+            continue
+
+        for acf in manifests:
+            info = _parse_steam_acf(acf)
+            appid = info.get("appid") or re.sub(r"\D", "", acf.stem)
+            if not appid or appid in seen:
+                continue
+            name = info.get("name", "").strip()
+            if not name or any(tool in name.lower() for tool in STEAM_TOOL_NAMES):
+                continue
+            installdir = info.get("installdir", "").strip()
+            game_path = steamapps / "common" / installdir if installdir else Path("")
+            if installdir and not game_path.is_dir():
+                continue
+            try:
+                size = int(info.get("SizeOnDisk", "0") or 0)
+            except ValueError:
+                size = 0
+
+            cover_local = ""
+            cache_dirs = (appcache, library / "appcache" / "librarycache")
+            for cache_root in cache_dirs:
+                for candidate in (
+                    cache_root / f"{appid}_header.jpg",
+                    cache_root / f"{appid}_library_600x900.jpg",
+                    cache_root / appid / "library_600x900.jpg",
+                    cache_root / appid / "library_hero.jpg",
+                    cache_root / appid / "header.jpg",
+                ):
+                    if candidate.exists():
+                        cover_local = str(candidate)
+                        break
+                if cover_local:
+                    break
+
+            if not cover_local:
+                for cache_root in cache_dirs:
+                    cache_dir = cache_root / appid
+                    if not cache_dir.is_dir():
+                        continue
+                    images = []
+                    try:
+                        for item in cache_dir.iterdir():
+                            if item.is_file() and item.suffix.lower() in (".jpg", ".jpeg", ".png"):
+                                try:
+                                    images.append((item.stat().st_size, item))
+                                except OSError:
+                                    pass
+                    except OSError:
+                        pass
+                    if images:
+                        images.sort(reverse=True)
+                        cover_local = str(images[0][1])
+                        break
+
+            seen.add(appid)
+            games.append({
+                "key": f"steam:{appid}",
+                "appid": appid,
+                "name": name,
+                "path": str(game_path) if installdir else "",
+                "size": size,
+                "cover_path": cover_local,
+                "cover_url": STEAM_CDN_HEADER.format(appid=appid),
+                "library": str(library),
+            })
+
+    games.sort(key=lambda g: g["name"].lower())
+    return games
+
+
+def launch_steam_game(appid: str) -> None:
+    url = f"steam://rungameid/{appid}"
+    if os.name == "nt":
+        os.startfile(url)  # type: ignore[attr-defined]
+    elif sys.platform == "darwin":
+        subprocess.Popen(["open", url])
+    else:
+        subprocess.Popen(["xdg-open", url])
+
+
+# ---------------------------------------------------------------------------
+#  UPDATES (GitHub releases)
+# ---------------------------------------------------------------------------
+
+def parse_version(value: str) -> tuple:
+    numbers = re.findall(r"\d+", str(value or ""))
+    return tuple(int(n) for n in numbers[:4]) if numbers else (0,)
+
+
+def is_newer_version(remote: str, current: str) -> bool:
+    def normalized(v):
+        parts = list(parse_version(v))
+        while len(parts) < 4:
+            parts.append(0)
+        return tuple(parts)
+    return normalized(remote) > normalized(current)
+
+
+def fetch_latest_release() -> dict:
+    req = urllib.request.Request(
+        GITHUB_RELEASES_API,
+        headers={"User-Agent": USER_AGENT, "Accept": "application/vnd.github+json"},
+    )
+    with urllib.request.urlopen(req, timeout=20) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+    if not isinstance(data, dict):
+        raise ValueError("Unexpected GitHub response")
+    return data
+
+
+def pick_update_asset(assets):
+    """Picks the best release asset for the current platform."""
+    if not assets:
+        return None
+    if os.name == "nt":
+        preferred = (".zip", ".exe", ".msi")
+    elif sys.platform == "darwin":
+        preferred = (".dmg", ".zip")
+    else:
+        preferred = (".appimage", ".tar.gz", ".zip")
+
+    best = None
+    for asset in assets:
+        name = str(asset.get("name", "")).lower()
+        for rank, ext in enumerate(preferred):
+            if name.endswith(ext):
+                score = (len(preferred) - rank) * 10
+                if os.name == "nt" and "windows" in name:
+                    score += 5
+                if best is None or score > best[0]:
+                    best = (score, asset)
+                break
+    return best[1] if best else None
+
+
 class RoundedCoverLabel(QLabel):
     def __init__(self, radius_top=12, parent=None):
         super().__init__(parent)
@@ -597,79 +1179,188 @@ class ExtractWorker(QThread):
 
 
 class ManifestScanner(QThread):
+    """Scans the games folder (.dvp/.zip/.exe/shortcuts) and linked library."""
     finished = pyqtSignal(dict)
 
-    def __init__(self, games_dir, cache):
+    def __init__(self, games_dir, cache, external=None):
         super().__init__()
         self.games_dir = games_dir
-        self.cache = cache
+        self.cache = cache or {}
+        self.external = external or {}
+
+    def _type_for(self, ext: str) -> str:
+        if ext == ".dvp":
+            return "dvp"
+        if ext == ".zip":
+            return "zip"
+        if ext in (".bat", ".cmd"):
+            return "script"
+        if ext in (".lnk", ".url"):
+            return "shortcut"
+        return "exe"
+
+    def _scan_archive(self, p: str, f: str, entry: dict) -> None:
+        cover_source = f"{entry['type']}:{f}:{int(entry['mtime'])}"
+        cached_cover = _cover_cache_file(cover_source)
+        try:
+            with zipfile.ZipFile(p, "r") as zf:
+                names = zf.namelist()
+                manifest = None
+                if "manifest.json" in names:
+                    try:
+                        manifest = json.loads(zf.read("manifest.json").decode("utf-8"))
+                    except Exception as e:
+                        entry["error"] = f"Bad manifest: {e}"
+
+                if manifest:
+                    entry["name"] = manifest.get("name", entry["name"])
+                    entry["created"] = manifest.get("created", "")
+                    exe_name = manifest.get("exe", "") or ""
+                    if exe_name and exe_name != "unknown":
+                        entry["exe"] = os.path.basename(exe_name)
+                    cover_hex = manifest.get("cover_data")
+                    if cover_hex and not (cached_cover.exists() and cached_cover.stat().st_size > 0):
+                        try:
+                            store_cover_bytes(cover_source, bytes.fromhex(cover_hex))
+                        except Exception as e:
+                            log.warning(f"Битая обложка в {f}: {e}")
+
+                if not entry.get("exe"):
+                    found = detect_exe_in_archive(zf)
+                    if found:
+                        entry["exe"] = os.path.basename(found)
+                        entry["exe_in_archive"] = found
+
+                if not (cached_cover.exists() and cached_cover.stat().st_size > 0):
+                    found_cover = find_cover_in_archive(zf)
+                    if found_cover:
+                        data, ext = found_cover
+                        store_cover_bytes(cover_source, data)
+                        entry["cover_ext"] = ext
+
+            if cached_cover.exists() and cached_cover.stat().st_size > 0:
+                entry["cover_path"] = str(cached_cover)
+        except zipfile.BadZipFile:
+            entry["error"] = f"Corrupted {entry['type']}"
+        except Exception as e:
+            entry["error"] = f"Read error: {e}"
 
     def run(self):
         manifests = {}
         try:
-            files = [f for f in os.listdir(self.games_dir) if f.endswith(".dvp")]
+            files = sorted(os.listdir(self.games_dir))
         except Exception as e:
             log.error(f"Не могу прочитать папку игр: {e}")
-            self.finished.emit({})
-            return
+            files = []
 
         for f in files:
+            ext = os.path.splitext(f)[1].lower()
+            if ext not in SUPPORTED_EXTENSIONS:
+                continue
             p = os.path.join(self.games_dir, f)
             try:
                 mtime = os.path.getmtime(p)
                 size = os.path.getsize(p)
-            except:
+            except OSError:
                 continue
 
+            game_type = self._type_for(ext)
             cached = self.cache.get(f, {})
-            if cached.get("mtime") == mtime and cached.get("size") == size:
+            cached_cover_ok = (not cached.get("cover_path")
+                               or os.path.exists(cached.get("cover_path", "")))
+            if (cached.get("mtime") == mtime and cached.get("size") == size
+                    and cached.get("type") == game_type and cached_cover_ok):
                 manifests[f] = cached
                 continue
 
             entry = {
-                "mtime": mtime, "size": size, "path": p,
-                "name": f.replace(".dvp", ""), "exe": "unknown",
-                "created": "", "cover_data": None, "cover_ext": ".png", "error": None
+                "mtime": mtime, "size": size, "path": p, "type": game_type,
+                "name": prettify_name(Path(f).stem), "exe": "", "exe_in_archive": "",
+                "created": "", "cover_path": "", "cover_url": "", "error": None,
             }
-            try:
-                with zipfile.ZipFile(p, 'r') as zf:
-                    if "manifest.json" in zf.namelist():
-                        mf = json.loads(zf.read("manifest.json").decode("utf-8"))
-                        entry["name"] = mf.get("name", entry["name"])
-                        entry["exe"] = mf.get("exe", "unknown")
-                        entry["created"] = mf.get("created", "")
-                        entry["cover_data"] = mf.get("cover_data")
-                        entry["cover_ext"] = mf.get("cover_ext", ".png")
-                    else:
-                        entry["error"] = "manifest.json missing"
-            except zipfile.BadZipFile:
-                entry["error"] = "Corrupted .dvp"
-            except Exception as e:
-                entry["error"] = f"Read error: {e}"
+
+            if game_type in ("dvp", "zip"):
+                self._scan_archive(p, f, entry)
+            elif game_type == "exe":
+                entry["exe"] = p
+            elif game_type == "script":
+                entry["exe"] = p
 
             manifests[f] = entry
+
+        for key, ext_entry in self.external.items():
+            try:
+                manifests[key] = self._external_entry(key, ext_entry)
+            except Exception as e:
+                log.warning(f"Пропущена внешняя игра {key}: {e}")
+
         self.finished.emit(manifests)
+
+    def _external_entry(self, key: str, ext_entry: dict) -> dict:
+        game_type = ext_entry.get("type", "exe")
+        path = str(ext_entry.get("path", ""))
+        entry = {
+            "mtime": ext_entry.get("added", 0),
+            "size": ext_entry.get("size", 0),
+            "path": path,
+            "type": game_type,
+            "name": ext_entry.get("name", key),
+            "exe": str(ext_entry.get("exe", "")),
+            "created": "",
+            "cover_path": str(ext_entry.get("cover_path", "")),
+            "cover_url": str(ext_entry.get("cover_url", "")),
+            "external": True,
+            "error": None,
+        }
+        if game_type == "steam":
+            entry["appid"] = ext_entry.get("appid", key.split(":")[-1])
+            if entry["cover_path"] and not os.path.exists(entry["cover_path"]):
+                entry["cover_path"] = ""
+            if path and not os.path.isdir(path):
+                entry["error"] = "Not installed"
+        elif game_type == "folder":
+            if not os.path.isdir(path):
+                entry["error"] = "Folder not found"
+            else:
+                try:
+                    entry["mtime"] = os.path.getmtime(path)
+                except OSError:
+                    pass
+                if not entry["exe"] or not os.path.exists(entry["exe"]):
+                    entry["exe"] = detect_executable(path)
+        else:
+            if not os.path.exists(path):
+                entry["error"] = "File not found"
+            else:
+                try:
+                    entry["mtime"] = os.path.getmtime(path)
+                    entry["size"] = os.path.getsize(path)
+                except OSError:
+                    pass
+                if not entry["exe"]:
+                    entry["exe"] = path
+        return entry
 
 
 class CoverLoader(QRunnable):
     class Signals(QObject):
-        loaded = pyqtSignal(str, QPixmap)
+        loaded = pyqtSignal(str, QImage)
 
-    def __init__(self, key, hex_data):
+    def __init__(self, key, path="", url="", data=None):
         super().__init__()
         self.key = key
-        self.hex_data = hex_data
+        self.path = path
+        self.url = url
+        self.data = data or b""
         self.signals = CoverLoader.Signals()
 
     def run(self):
         try:
-            data = bytes.fromhex(self.hex_data)
-            pm = QPixmap()
-            pm.loadFromData(data)
-            self.signals.loaded.emit(self.key, pm)
+            image = load_cover_image(self.path, self.url, self.data)
         except Exception as e:
             log.warning(f"Обложка не загрузилась: {e}")
-            self.signals.loaded.emit(self.key, QPixmap())
+            image = QImage()
+        self.signals.loaded.emit(self.key, image)
 
 
 CARD_WIDTH = 240
@@ -712,8 +1403,8 @@ class GameCard(QFrame):
                 "background-color: #1A1010; "
                 "color: #FF6B6B; font-size: 11px;"
             )
-        elif meta.get("cover_data"):
-            QThreadPool.globalInstance().start(self._make_cover_loader(meta["cover_data"]))
+        elif meta.get("cover_path") or meta.get("cover_url") or meta.get("cover_data"):
+            QThreadPool.globalInstance().start(self._make_cover_loader(meta))
 
         outer.addWidget(self.cover)
 
@@ -729,7 +1420,13 @@ class GameCard(QFrame):
         top_row = QHBoxLayout()
         top_row.setSpacing(6)
 
-        self.name_label = QLabel(meta.get("name", "Unknown"))
+        display_name = meta.get("name", "Unknown")
+        if show_ext and meta.get("type") not in ("steam", "folder"):
+            suffix = os.path.splitext(meta.get("path", ""))[1]
+            if suffix:
+                display_name = f"{display_name}{suffix}"
+        self.name_label = QLabel(display_name)
+        self.name_label.setToolTip(display_name)
         self.name_label.setStyleSheet(
             "color: #FFFFFF; font-size: 13px; font-weight: bold; "
             "letter-spacing: -0.3px; background: transparent;"
@@ -795,15 +1492,23 @@ class GameCard(QFrame):
                 QPushButton:hover {{ color: #FFD166; }}
             """)
 
-    def _make_cover_loader(self, hex_data):
-        loader = CoverLoader(self.key, hex_data)
+    def _make_cover_loader(self, meta):
+        data = None
+        if meta.get("cover_data"):
+            try:
+                data = bytes.fromhex(meta["cover_data"])
+            except Exception:
+                data = None
+        loader = CoverLoader(self.key, meta.get("cover_path", ""),
+                             meta.get("cover_url", ""), data)
         loader.signals.loaded.connect(self._on_cover_loaded)
         return loader
 
-    def _on_cover_loaded(self, key, pixmap):
-        if key == self.key and not pixmap.isNull():
-            self.cover.set_rounded_pixmap(pixmap)
-            self.cover.setText("")
+    def _on_cover_loaded(self, key, image):
+        if key != self.key or image.isNull():
+            return
+        self.cover.set_rounded_pixmap(QPixmap.fromImage(image))
+        self.cover.setText("")
 
     def _on_context(self, pos):
         self.context_menu_requested.emit(self.key, self.mapToGlobal(pos))
@@ -1019,13 +1724,14 @@ class SkeletonCard(QFrame):
 
 class SettingsDialog(QDialog):
     settings_applied = pyqtSignal(dict)
+    check_updates_requested = pyqtSignal()
 
     def __init__(self, config, parent=None):
         super().__init__(parent)
         self.config = config.copy()
         self.setWindowTitle(L.t("settings.title"))
         self.setWindowIcon(QApplication.windowIcon())
-        self.resize(580, 560)
+        self.resize(600, 800)
         self.setStyleSheet("""
             QDialog { background-color: #0A0A0A; }
             QLabel { color: #CCCCCC; font-size: 13px; }
@@ -1043,11 +1749,30 @@ class SettingsDialog(QDialog):
             QPushButton#Secondary:hover { background-color: #2A2A2A; }
             QPushButton#Danger { background-color: #1A1A1A; color: #FF6B6B; border: 1px solid #3A1A1A; }
             QPushButton#Danger:hover { background-color: #3A1A1A; }
+            QScrollArea { background: transparent; border: none; }
+            QScrollArea > QWidget > QWidget { background: transparent; }
+            QScrollBar:vertical { background: transparent; width: 8px; margin: 0; }
+            QScrollBar::handle:vertical { background: #222222; border-radius: 4px; min-height: 40px; }
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0px; }
+            QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: transparent; }
         """)
 
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(35, 30, 35, 30)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+
+        content = QWidget()
+        content.setStyleSheet("background: transparent;")
+        layout = QVBoxLayout(content)
+        layout.setContentsMargins(35, 30, 35, 20)
         layout.setSpacing(12)
+        scroll.setWidget(content)
+        outer.addWidget(scroll, stretch=1)
 
         title = QLabel(L.t("settings.title"))
         title.setStyleSheet("color: #FFFFFF; font-size: 26px; font-weight: 900; letter-spacing: -1px;")
@@ -1095,6 +1820,46 @@ class SettingsDialog(QDialog):
         layout.addWidget(self.start_collapsed)
 
         layout.addSpacing(10)
+        sec_steam = QLabel(L.t("settings.section.steam")); sec_steam.setObjectName("SectionTitle"); layout.addWidget(sec_steam)
+
+        self.auto_steam = QCheckBox(L.t("settings.auto_steam"))
+        self.auto_steam.setChecked(self.config.get("auto_steam_import", True))
+        layout.addWidget(self.auto_steam)
+
+        steam_row = QHBoxLayout()
+        detected = find_steam_path(self.config.get("steam_path", ""))
+        self.steam_input = QLineEdit(str(detected) if detected else self.config.get("steam_path", ""))
+        self.steam_input.setPlaceholderText(L.t("settings.steam_missing"))
+        sb = QPushButton("..."); sb.setObjectName("Secondary"); sb.setFixedWidth(45)
+        sb.clicked.connect(self._browse_steam)
+        steam_row.addWidget(self.steam_input); steam_row.addWidget(sb)
+        row_steam = QHBoxLayout(); lbl_steam = QLabel(L.t("settings.steam_path")); lbl_steam.setFixedWidth(150)
+        row_steam.addWidget(lbl_steam); row_steam.addLayout(steam_row); layout.addLayout(row_steam)
+
+        layout.addSpacing(10)
+        sec_updates = QLabel(L.t("settings.section.updates")); sec_updates.setObjectName("SectionTitle"); layout.addWidget(sec_updates)
+
+        self.check_updates = QCheckBox(L.t("settings.check_updates"))
+        self.check_updates.setChecked(self.config.get("check_updates", True))
+        layout.addWidget(self.check_updates)
+
+        upd_row = QHBoxLayout()
+        check_now = QPushButton(L.t("settings.check_now")); check_now.setObjectName("Secondary")
+        check_now.clicked.connect(self._request_update_check)
+        upd_row.addWidget(check_now); upd_row.addStretch(); layout.addLayout(upd_row)
+
+        layout.addSpacing(10)
+        sec_cache = QLabel(L.t("settings.section.cache")); sec_cache.setObjectName("SectionTitle"); layout.addWidget(sec_cache)
+
+        self.covers_label = QLabel(""); self.covers_label.setStyleSheet("color: #888888; font-size: 12px;")
+        layout.addWidget(self.covers_label)
+        self._update_covers()
+
+        covers_row = QHBoxLayout()
+        cc = QPushButton(L.t("settings.clear_covers")); cc.setObjectName("Danger"); cc.clicked.connect(self._clear_covers)
+        covers_row.addWidget(cc); covers_row.addStretch(); layout.addLayout(covers_row)
+
+        layout.addSpacing(10)
         sec4 = QLabel(L.t("settings.section.language")); sec4.setObjectName("SectionTitle"); layout.addWidget(sec4)
 
         lang_row = QHBoxLayout()
@@ -1114,15 +1879,36 @@ class SettingsDialog(QDialog):
         layout.addStretch()
 
         btns = QHBoxLayout()
+        btns.setContentsMargins(35, 10, 35, 20)
         r = QPushButton(L.t("settings.reset")); r.setObjectName("Secondary"); r.clicked.connect(self._reset)
         c2 = QPushButton(L.t("settings.cancel")); c2.setObjectName("Secondary"); c2.clicked.connect(self.reject)
         s = QPushButton(L.t("settings.save")); s.clicked.connect(self._save)
         btns.addWidget(r); btns.addStretch(); btns.addWidget(c2); btns.addWidget(s)
-        layout.addLayout(btns)
+        outer.addLayout(btns)
 
     def _browse(self):
         d = QFileDialog.getExistingDirectory(self, L.t("settings.games_dir"))
         if d: self.games_input.setText(d)
+
+    def _browse_steam(self):
+        d = QFileDialog.getExistingDirectory(self, L.t("settings.steam_path"))
+        if d: self.steam_input.setText(d)
+
+    def _update_covers(self):
+        count, size = cover_cache_stats()
+        self.covers_label.setText(L.t("settings.covers_info", count=count, size=human_size(size)))
+
+    def _clear_covers(self):
+        try:
+            clear_cover_cache()
+            self._update_covers()
+            QMessageBox.information(self, L.t("settings.section.cache"), L.t("settings.covers_cleared"))
+        except Exception as e:
+            QMessageBox.critical(self, L.t("settings.section.cache"), L.t("settings.temp_clear.error", error=str(e)))
+
+    def _request_update_check(self):
+        self._save()
+        self.check_updates_requested.emit()
 
     def _update_temp(self):
         t = self.config.get("temp_dir", str(CACHE_DIR))
@@ -1158,6 +1944,9 @@ class SettingsDialog(QDialog):
             self.auto_cleanup.setChecked(True)
             self.show_ext.setChecked(False)
             self.start_collapsed.setChecked(False)
+            self.auto_steam.setChecked(True)
+            self.check_updates.setChecked(True)
+            self.steam_input.setText(str(find_steam_path() or ""))
             for i in range(self.lang_combo.count()):
                 if self.lang_combo.itemData(i) == "en":
                     self.lang_combo.setCurrentIndex(i)
@@ -1168,6 +1957,9 @@ class SettingsDialog(QDialog):
         self.config["auto_cleanup"] = self.auto_cleanup.isChecked()
         self.config["show_extensions"] = self.show_ext.isChecked()
         self.config["sidebar_collapsed"] = self.start_collapsed.isChecked()
+        self.config["auto_steam_import"] = self.auto_steam.isChecked()
+        self.config["steam_path"] = self.steam_input.text().strip()
+        self.config["check_updates"] = self.check_updates.isChecked()
         self.config["language"] = self.lang_combo.currentData()
         save_json(CONFIG_PATH, self.config)
         self.settings_applied.emit(self.config)
@@ -1185,7 +1977,10 @@ class AboutDialog(QDialog):
             QLabel { color: #CCCCCC; font-size: 13px; }
             QPushButton { background-color: #FFFFFF; color: #000000; padding: 10px 22px; border-radius: 8px; font-weight: bold; font-size: 13px; }
             QPushButton:hover { background-color: #E0E0E0; }
+            QPushButton#Secondary { background-color: #141414; color: #DDDDDD; border: 1px solid #2A2A2A; }
+            QPushButton#Secondary:hover { background-color: #222222; }
         """)
+        self.check_requested = False
         l = QVBoxLayout(self)
         l.setContentsMargins(40, 35, 40, 35)
         l.setSpacing(15)
@@ -1225,9 +2020,586 @@ class AboutDialog(QDialog):
 
         l.addStretch()
 
+        check = QPushButton(L.t("about.check_updates"))
+        check.setObjectName("Secondary")
+        check.clicked.connect(self._request_check)
+        l.addWidget(check, alignment=Qt.AlignmentFlag.AlignCenter)
+
         ok = QPushButton(L.t("about.close"))
         ok.clicked.connect(self.accept)
         l.addWidget(ok, alignment=Qt.AlignmentFlag.AlignCenter)
+
+    def _request_check(self):
+        self.check_requested = True
+        self.accept()
+
+
+class SteamScanThread(QThread):
+    scanned = pyqtSignal(list, str)
+
+    def __init__(self, steam_path):
+        super().__init__()
+        self.steam_path = steam_path
+
+    def run(self):
+        try:
+            games = scan_steam_games(self.steam_path)
+            self.scanned.emit(games, "")
+        except Exception as e:
+            log.exception("Ошибка сканирования Steam")
+            self.scanned.emit([], str(e))
+
+
+class SteamImportDialog(QDialog):
+    """Lists installed Steam games and lets the user add them to the library."""
+
+    def __init__(self, steam_path, existing_keys, parent=None):
+        super().__init__(parent)
+        self.steam_path = steam_path
+        self.existing_keys = set(existing_keys)
+        self.games = []
+        self.rows = []
+        self.cover_loaders = []
+        self.scanner = None
+
+        self.selected_keys = set()
+        self.setWindowTitle(L.t("steam.title"))
+        self.setWindowIcon(QApplication.windowIcon())
+        self.resize(700, 660)
+        self.setStyleSheet("""
+            QDialog { background-color: #0A0A0A; }
+            QLabel { color: #CCCCCC; font-size: 13px; }
+            QScrollArea { background: transparent; border: none; }
+            QScrollArea > QWidget > QWidget { background: transparent; }
+            QLineEdit { background-color: #141414; color: #FFFFFF; border: 1px solid #222222; border-radius: 8px; padding: 9px 12px; font-size: 12px; }
+            QLineEdit:focus { border: 1px solid #333333; }
+            QCheckBox { color: #DDDDDD; font-size: 13px; spacing: 10px; }
+            QCheckBox::indicator { width: 18px; height: 18px; background-color: #141414; border: 1px solid #333333; border-radius: 4px; }
+            QCheckBox::indicator:checked { background-color: #FFFFFF; border: 1px solid #FFFFFF; }
+            QPushButton { background-color: #FFFFFF; color: #000000; padding: 9px 18px; border-radius: 8px; font-weight: bold; font-size: 13px; }
+            QPushButton:hover { background-color: #E0E0E0; }
+            QPushButton#Secondary { background-color: #141414; color: #DDDDDD; border: 1px solid #2A2A2A; }
+            QPushButton#Secondary:hover { background-color: #222222; }
+            QScrollBar:vertical { background: transparent; width: 8px; }
+            QScrollBar::handle:vertical { background: #222222; border-radius: 4px; min-height: 40px; }
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0px; }
+        """)
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(30, 25, 30, 25)
+        root.setSpacing(12)
+
+        title = QLabel(L.t("steam.title"))
+        title.setStyleSheet("color: #FFFFFF; font-size: 24px; font-weight: 900; letter-spacing: -1px;")
+        root.addWidget(title)
+
+        sub = QLabel(L.t("steam.subtitle"))
+        sub.setStyleSheet("color: #666666; font-size: 12px;")
+        root.addWidget(sub)
+
+        self.path_label = QLabel(L.t("steam.path", path=str(steam_path) if steam_path else L.t("settings.steam_missing")))
+        self.path_label.setStyleSheet("color: #444444; font-size: 11px;")
+        root.addWidget(self.path_label)
+
+        hint = QLabel(L.t("steam.selection_hint"))
+        hint.setStyleSheet("color: #555555; font-size: 11px;")
+        root.addWidget(hint)
+
+        self.search = QLineEdit()
+        self.search.setPlaceholderText(L.t("steam.search_placeholder"))
+        self.search.textChanged.connect(self._populate)
+        root.addWidget(self.search)
+
+        self.status = QLabel(L.t("steam.scanning"))
+        self.status.setStyleSheet("color: #777777; font-size: 11px;")
+        root.addWidget(self.status)
+
+        self.scroll = QScrollArea()
+        self.scroll.setWidgetResizable(True)
+        self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.host = QWidget()
+        self.list_layout = QVBoxLayout(self.host)
+        self.list_layout.setContentsMargins(2, 2, 2, 2)
+        self.list_layout.setSpacing(4)
+        self.list_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
+        self.scroll.setWidget(self.host)
+        root.addWidget(self.scroll, stretch=1)
+
+        tools = QHBoxLayout()
+        self.sel_all = QPushButton(L.t("steam.select_all")); self.sel_all.setObjectName("Secondary")
+        self.sel_none = QPushButton(L.t("steam.select_none")); self.sel_none.setObjectName("Secondary")
+        self.sel_all.clicked.connect(lambda: self._set_all(True))
+        self.sel_none.clicked.connect(lambda: self._set_all(False))
+        tools.addWidget(self.sel_all); tools.addWidget(self.sel_none); tools.addStretch()
+        root.addLayout(tools)
+
+        buttons = QHBoxLayout()
+        cancel = QPushButton(L.t("settings.cancel")); cancel.setObjectName("Secondary"); cancel.clicked.connect(self.reject)
+        self.add_btn = QPushButton(L.t("steam.apply_selection", count=0))
+        self.add_btn.setEnabled(False)
+        self.add_btn.clicked.connect(self._accept_selection)
+        buttons.addStretch(); buttons.addWidget(cancel); buttons.addWidget(self.add_btn)
+        root.addLayout(buttons)
+
+        self._start_scan()
+
+    def _start_scan(self):
+        if not self.steam_path:
+            self.status.setText(L.t("steam.not_found"))
+            return
+        self.scanner = SteamScanThread(self.steam_path)
+        self.scanner.scanned.connect(self._on_scanned)
+        self.scanner.start()
+
+    def _on_scanned(self, games, error):
+        if error:
+            self.status.setText(L.t("update.check_failed", error=error))
+            return
+        self.games = games
+        if not games:
+            self.status.setText(L.t("steam.empty"))
+            return
+        self.status.setText(L.t("steam.found", count=len(games)))
+        self._populate()
+
+    def _populate(self):
+        while self.list_layout.count():
+            item = self.list_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+        self.rows.clear()
+
+        query = self.search.text().strip().lower()
+        for game in self.games:
+            if query and query not in game["name"].lower():
+                continue
+            already = game["key"] in self.existing_keys
+            row = QWidget()
+            row.setStyleSheet("QWidget { background: transparent; }")
+            rl = QHBoxLayout(row)
+            rl.setContentsMargins(6, 4, 6, 4)
+            rl.setSpacing(10)
+
+            cb = QCheckBox()
+            cb.setChecked(already)
+            cb.setToolTip(L.t("steam.selection_hint"))
+            cb.stateChanged.connect(self._update_count)
+
+            thumb = QLabel()
+            thumb.setFixedSize(92, 43)
+            thumb.setStyleSheet("background-color: #141414; border-radius: 6px; color: #444444;")
+            thumb.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            thumb.setText("Steam" if not (game.get("cover_path") or game.get("cover_url")) else "")
+            if game.get("cover_path") or game.get("cover_url"):
+                loader = CoverLoader(game["key"], game.get("cover_path", ""), game.get("cover_url", ""))
+                loader.signals.loaded.connect(lambda key, img, lbl=thumb: self._set_thumb(lbl, img))
+                self.cover_loaders.append(loader)
+                QThreadPool.globalInstance().start(loader)
+
+            info = QVBoxLayout()
+            info.setSpacing(2)
+            name = QLabel(game["name"])
+            name.setWordWrap(True)
+            name.setStyleSheet("color: #FFFFFF; font-size: 13px; font-weight: 600;")
+            meta = QLabel(human_size(game.get("size", 0)))
+            meta.setStyleSheet("color: #666666; font-size: 10px;")
+            if already:
+                meta.setText(f"{human_size(game.get('size', 0))}  •  {L.t('steam.already_added')}")
+            info.addWidget(name); info.addWidget(meta)
+
+            rl.addWidget(cb); rl.addWidget(thumb); rl.addLayout(info, stretch=1)
+            self.list_layout.addWidget(row)
+            self.rows.append((game, cb))
+
+        self._update_count()
+
+    def _set_thumb(self, label, image):
+        if image.isNull():
+            return
+        pm = QPixmap.fromImage(image).scaled(
+            92, 43, Qt.AspectRatioMode.KeepAspectRatioByExpanding,
+            Qt.TransformationMode.SmoothTransformation)
+        label.setPixmap(pm)
+
+    def _set_all(self, checked):
+        for _, cb in self.rows:
+            cb.setChecked(checked)
+
+    def _selected(self):
+        return [game for game, cb in self.rows if cb.isChecked()]
+
+    def _update_count(self):
+        count = len(self._selected())
+        self.add_btn.setText(L.t("steam.apply_selection", count=count))
+        self.add_btn.setEnabled(bool(self.rows))
+
+    def _accept_selection(self):
+        self.selected_games = self._selected()
+        self.selected_keys = {game["key"] for game in self.selected_games}
+        self.accept()
+
+    def closeEvent(self, event):
+        if self.scanner and self.scanner.isRunning():
+            self.scanner.wait(1500)
+        super().closeEvent(event)
+
+
+class UpdateCheckThread(QThread):
+    checked = pyqtSignal(dict, str)
+
+    def run(self):
+        try:
+            release = fetch_latest_release()
+            self.checked.emit(release, "")
+        except urllib.error.HTTPError as e:
+            message = f"GitHub API {e.code}"
+            if e.code == 403:
+                message = "GitHub API rate limit (403)"
+            self.checked.emit({}, message)
+        except Exception as e:
+            log.warning(f"Не удалось проверить обновления: {e}")
+            self.checked.emit({}, str(e))
+
+
+class UpdateDownloadThread(QThread):
+    progress = pyqtSignal(int)
+    downloaded = pyqtSignal(str)
+    failed = pyqtSignal(str)
+
+    def __init__(self, asset, expected_version):
+        super().__init__()
+        self.asset = asset
+        self.expected_version = expected_version
+
+    def run(self):
+        try:
+            UPDATES_DIR.mkdir(parents=True, exist_ok=True)
+            name = self.asset.get("name") or f"Devers-Launcher-{self.expected_version}.zip"
+            safe_name = re.sub(r"[^\w.\- ]+", "_", name)
+            target = UPDATES_DIR / safe_name
+            partial = target.with_name(target.name + ".part")
+            req = urllib.request.Request(
+                self.asset["browser_download_url"],
+                headers={"User-Agent": USER_AGENT},
+            )
+            total = int(self.asset.get("size", 0) or 0)
+            received = 0
+            with urllib.request.urlopen(req, timeout=30) as resp, open(partial, "wb") as f:
+                total = int(resp.headers.get("Content-Length") or total or 0)
+                while True:
+                    chunk = resp.read(256 * 1024)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    received += len(chunk)
+                    if total > 0:
+                        self.progress.emit(min(100, int(received * 100 / total)))
+                    else:
+                        self.progress.emit(-1)
+            if total > 0 and received < total:
+                raise IOError(f"Incomplete download ({received}/{total} bytes)")
+            os.replace(partial, target)
+            self.progress.emit(100)
+            self.downloaded.emit(str(target))
+        except Exception as e:
+            log.exception("Ошибка загрузки обновления")
+            self.failed.emit(str(e))
+
+
+UPDATE_DIALOG_STYLE = """
+    QDialog { background-color: #0A0A0A; }
+    QLabel { color: #CCCCCC; font-size: 13px; }
+    QLabel#DialogTitle { color: #FFFFFF; font-size: 22px; font-weight: 900; letter-spacing: -1px; }
+    QLabel#DialogSub { color: #666666; font-size: 12px; }
+    QProgressBar { background-color: #1A1A1A; border: none; border-radius: 6px; height: 12px; text-align: center; color: transparent; }
+    QProgressBar::chunk { background-color: #FFFFFF; border-radius: 6px; }
+    QPushButton { background-color: #FFFFFF; color: #000000; padding: 10px 20px; border-radius: 8px; font-weight: bold; font-size: 13px; }
+    QPushButton:hover { background-color: #E0E0E0; }
+    QPushButton:disabled { background-color: #333333; color: #777777; }
+    QPushButton#Secondary { background-color: #141414; color: #DDDDDD; border: 1px solid #2A2A2A; }
+    QPushButton#Secondary:hover { background-color: #222222; }
+    QScrollArea { background: transparent; border: none; }
+    QScrollArea > QWidget > QWidget { background: transparent; }
+    QScrollBar:vertical { background: transparent; width: 8px; margin: 0; }
+    QScrollBar::handle:vertical { background: #222222; border-radius: 4px; min-height: 40px; }
+    QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0px; }
+"""
+
+
+def dialog_logo_label(size=52):
+    """Returns the app logo (or a fallback mark) as a QLabel."""
+    label = QLabel()
+    label.setFixedSize(size, size)
+    label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+    logo_path = ICON_DIR / "logo.png"
+    if logo_path.exists():
+        pm = QPixmap(str(logo_path))
+        if not pm.isNull():
+            label.setPixmap(pm.scaled(size, size, Qt.AspectRatioMode.KeepAspectRatio,
+                                      Qt.TransformationMode.SmoothTransformation))
+            return label
+    label.setText("✦")
+    label.setStyleSheet(f"color: #FFFFFF; font-size: {int(size * 0.7)}px; font-weight: 900;")
+    return label
+
+
+class UpdateCheckDialog(QDialog):
+    """Small non-modal dialog shown while the launcher checks GitHub."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(L.t("update.check_title"))
+        self.setWindowIcon(QApplication.windowIcon())
+        self.setWindowFlag(Qt.WindowType.WindowCloseButtonHint, False)
+        self.setModal(False)
+        self.setFixedSize(420, 190)
+        self.setStyleSheet(UPDATE_DIALOG_STYLE)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(28, 24, 28, 24)
+        layout.setSpacing(10)
+
+        header = QHBoxLayout()
+        header.setSpacing(14)
+        header.addWidget(dialog_logo_label(44))
+
+        text_box = QVBoxLayout()
+        text_box.setSpacing(4)
+        title = QLabel(L.t("update.check_title"))
+        title.setObjectName("DialogTitle")
+        hint = QLabel(L.t("update.checking_hint"))
+        hint.setObjectName("DialogSub")
+        hint.setWordWrap(True)
+        text_box.addWidget(title)
+        text_box.addWidget(hint)
+        header.addLayout(text_box, stretch=1)
+        layout.addLayout(header)
+
+        layout.addStretch()
+
+        self.progress = QProgressBar()
+        self.progress.setRange(0, 0)
+        self.progress.setFixedHeight(10)
+        layout.addWidget(self.progress)
+
+
+def _notes_plain_text(raw: str) -> str:
+    """Turns release markdown into readable plain text for the notes panel."""
+    text = raw or ""
+    text = re.sub(r"```[\s\S]*?```", "", text)
+    text = re.sub(r"!\[([^\]]*)\]\([^)]*\)", r"\1", text)
+    text = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", r"\1", text)
+    text = re.sub(r"^#{1,6}\s*", "", text, flags=re.M)
+    text = re.sub(r"[*_`>]", "", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip() or "—"
+
+
+class UpdateInfoDialog(QDialog):
+    """Styled message dialog for update checks (up to date, errors)."""
+
+    def __init__(self, title, message, detail="", primary_text=None, retry=False,
+                 secondary_text=None, page_url="", parent=None):
+        super().__init__(parent)
+        self.retry_requested = False
+        self.setWindowTitle(title)
+        self.setWindowIcon(QApplication.windowIcon())
+        self.setStyleSheet(UPDATE_DIALOG_STYLE)
+        self.setMinimumWidth(460)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(28, 26, 28, 24)
+        layout.setSpacing(12)
+
+        header = QHBoxLayout()
+        header.setSpacing(14)
+        header.addWidget(dialog_logo_label(48), alignment=Qt.AlignmentFlag.AlignTop)
+
+        text_box = QVBoxLayout()
+        text_box.setSpacing(6)
+        title_label = QLabel(title)
+        title_label.setObjectName("DialogTitle")
+        message_label = QLabel(message)
+        message_label.setWordWrap(True)
+        message_label.setStyleSheet("color: #AAAAAA; font-size: 13px;")
+        text_box.addWidget(title_label)
+        text_box.addWidget(message_label)
+        if detail:
+            detail_label = QLabel(detail)
+            detail_label.setWordWrap(True)
+            detail_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextBrowserInteraction)
+            detail_label.setStyleSheet("color: #666666; font-size: 11px;")
+            text_box.addWidget(detail_label)
+        header.addLayout(text_box, stretch=1)
+        layout.addLayout(header)
+
+        buttons = QHBoxLayout()
+        buttons.addStretch()
+        if page_url:
+            page = QPushButton(L.t("update.page"))
+            page.setObjectName("Secondary")
+            page.clicked.connect(lambda: webbrowser.open(page_url))
+            buttons.addWidget(page)
+        if secondary_text:
+            close_btn = QPushButton(secondary_text)
+            close_btn.setObjectName("Secondary")
+            close_btn.clicked.connect(self.reject)
+            buttons.addWidget(close_btn)
+        primary = QPushButton(primary_text or L.t("update.close"))
+        primary.clicked.connect(self._primary)
+        buttons.addWidget(primary)
+        layout.addLayout(buttons)
+
+    def _primary(self):
+        self.retry_requested = True
+        self.accept()
+
+
+class UpdateDialog(QDialog):
+    """Shows release notes and downloads the new build."""
+
+    install_requested = pyqtSignal(str)
+
+    def __init__(self, release, asset, parent=None):
+        super().__init__(parent)
+        self.release = release
+        self.asset = asset
+        self.downloader = None
+        self.downloaded_path = ""
+
+        version = str(release.get("tag_name") or release.get("name") or "?")
+        self.setWindowTitle(L.t("update.title"))
+        self.setWindowIcon(QApplication.windowIcon())
+        self.setStyleSheet(UPDATE_DIALOG_STYLE)
+        self.resize(600, 620)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(30, 26, 30, 26)
+        layout.setSpacing(14)
+
+        header = QHBoxLayout()
+        header.setSpacing(14)
+        header.addWidget(dialog_logo_label(52), alignment=Qt.AlignmentFlag.AlignTop)
+
+        head_text = QVBoxLayout()
+        head_text.setSpacing(4)
+        title = QLabel(L.t("update.title"))
+        title.setObjectName("DialogTitle")
+        found = QLabel(L.t("update.found", version=version, current=VERSION))
+        found.setStyleSheet("color: #888888; font-size: 12px;")
+        found.setWordWrap(True)
+        head_text.addWidget(title)
+        head_text.addWidget(found)
+        header.addLayout(head_text, stretch=1)
+        layout.addLayout(header)
+
+        chips = QHBoxLayout()
+        chips.setSpacing(8)
+        current_chip = QLabel(f"v{VERSION}")
+        current_chip.setStyleSheet("color: #777777; background-color: #141414; border: 1px solid #222222; "
+                                   "border-radius: 10px; padding: 4px 12px; font-size: 11px;")
+        arrow = QLabel("→")
+        arrow.setStyleSheet("color: #555555; font-size: 14px;")
+        new_chip = QLabel(version if version.lower().startswith("v") else f"v{version}")
+        new_chip.setStyleSheet("color: #000000; background-color: #FFFFFF; border-radius: 10px; "
+                               "padding: 4px 12px; font-size: 11px; font-weight: bold;")
+        chips.addWidget(current_chip)
+        chips.addWidget(arrow)
+        chips.addWidget(new_chip)
+        chips.addStretch()
+        if asset:
+            asset_label = QLabel(L.t("update.asset", name=asset.get("name", ""),
+                                      size=human_size(asset.get("size", 0))))
+            asset_label.setStyleSheet("color: #555555; font-size: 11px;")
+            chips.addWidget(asset_label)
+        layout.addLayout(chips)
+
+        notes_title = QLabel(L.t("update.notes"))
+        notes_title.setStyleSheet("color: #666666; font-size: 11px; letter-spacing: 1px;")
+        layout.addWidget(notes_title)
+
+        body = QLabel(_notes_plain_text(str(release.get("body") or "")))
+        body.setWordWrap(True)
+        body.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
+        body.setStyleSheet("color: #AAAAAA; font-size: 12px; background-color: #0F0F0F; "
+                          "border: 1px solid #1E1E1E; border-radius: 8px; padding: 14px;")
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll_host = QWidget()
+        sh = QVBoxLayout(scroll_host)
+        sh.setContentsMargins(0, 0, 0, 0)
+        sh.addWidget(body)
+        sh.addStretch()
+        scroll.setWidget(scroll_host)
+        layout.addWidget(scroll, stretch=1)
+
+        self.progress = QProgressBar()
+        self.progress.setRange(0, 100)
+        self.progress.setValue(0)
+        self.progress.setFixedHeight(12)
+        self.progress.setVisible(False)
+        layout.addWidget(self.progress)
+
+        self.status = QLabel("")
+        self.status.setStyleSheet("color: #777777; font-size: 11px;")
+        self.status.setWordWrap(True)
+        layout.addWidget(self.status)
+
+        buttons = QHBoxLayout()
+        buttons.setSpacing(8)
+        page = QPushButton(L.t("update.page")); page.setObjectName("Secondary")
+        page.clicked.connect(lambda: webbrowser.open(release.get("html_url") or GITHUB_RELEASES_PAGE))
+        later = QPushButton(L.t("update.later")); later.setObjectName("Secondary"); later.clicked.connect(self.reject)
+        self.download_btn = QPushButton(L.t("update.download"))
+        self.download_btn.setEnabled(asset is not None)
+        self.download_btn.clicked.connect(self._start_download)
+        buttons.addWidget(page); buttons.addStretch(); buttons.addWidget(later); buttons.addWidget(self.download_btn)
+        layout.addLayout(buttons)
+
+        if asset is None:
+            self.status.setText(L.t("update.no_asset"))
+        elif not getattr(sys, "frozen", False):
+            self.status.setText(L.t("update.source_hint"))
+
+    def _start_download(self):
+        if not self.asset or self.downloader:
+            return
+        self.download_btn.setEnabled(False)
+        self.progress.setVisible(True)
+        self.status.setText(L.t("update.downloading", percent=0))
+        self.downloader = UpdateDownloadThread(self.asset, self.release.get("tag_name", VERSION))
+        self.downloader.progress.connect(self._on_progress)
+        self.downloader.downloaded.connect(self._on_downloaded)
+        self.downloader.failed.connect(self._on_failed)
+        self.downloader.start()
+
+    def _on_progress(self, value):
+        if value < 0:
+            self.progress.setRange(0, 0)
+            self.status.setText(L.t("update.downloading", percent="..."))
+            return
+        self.progress.setRange(0, 100)
+        self.progress.setValue(value)
+        self.status.setText(L.t("update.downloading", percent=value))
+
+    def _on_downloaded(self, path):
+        self.downloaded_path = path
+        self.progress.setRange(0, 100)
+        self.progress.setValue(100)
+        self.status.setText(L.t("update.ready"))
+        self.install_requested.emit(path)
+        self.accept()
+
+    def _on_failed(self, error):
+        self.progress.setVisible(False)
+        self.download_btn.setEnabled(True)
+        self.status.setText(L.t("update.download_error", error=error))
+
+    def closeEvent(self, event):
+        if self.downloader and self.downloader.isRunning():
+            self.downloader.wait(1500)
+        super().closeEvent(event)
 
 
 class HomePage(QWidget):
@@ -1287,8 +2659,11 @@ class LibraryPage(QWidget):
     play_requested = pyqtSignal(str)
     context_requested = pyqtSignal(str, QPoint)
     favorite_toggled = pyqtSignal(str)
+    add_requested = pyqtSignal()
+    folder_requested = pyqtSignal()
+    steam_requested = pyqtSignal()
 
-    def __init__(self, config, favorites_getter, play_times_getter, page_title):
+    def __init__(self, config, favorites_getter, play_times_getter, page_title, show_tools=True):
         super().__init__()
         self.config = config
         self.favorites_getter = favorites_getter
@@ -1301,14 +2676,54 @@ class LibraryPage(QWidget):
         layout.setSpacing(15)
 
         header = QHBoxLayout()
+        header.setSpacing(8)
         title = QLabel(page_title)
         title.setObjectName("PageTitle")
         header.addWidget(title)
         header.addStretch()
 
+        tool_style = """
+            QPushButton {
+                background-color: #0F0F0F; color: #CCCCCC;
+                border: 1px solid #1A1A1A; border-radius: 8px;
+                padding: 8px 12px; font-size: 12px;
+            }
+            QPushButton:hover { background-color: #1A1A1A; color: #FFFFFF; }
+        """
+
+        self.add_btn = QPushButton(L.t("library.add_game"))
+        self.add_btn.setStyleSheet(tool_style)
+        self.add_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.add_btn.setToolTip(L.t("dialog.add.filter"))
+        self.add_btn.clicked.connect(self.add_requested)
+        self.add_btn.setVisible(show_tools)
+        header.addWidget(self.add_btn)
+
+        self.folder_btn = QPushButton("＋")
+        self.folder_btn.setFixedSize(38, 36)
+        folder_icon = get_icon("folder", 16)
+        if folder_icon:
+            self.folder_btn.setIcon(folder_icon)
+            self.folder_btn.setIconSize(QSize(16, 16))
+            self.folder_btn.setText("")
+        self.folder_btn.setStyleSheet(tool_style + "QPushButton { font-size: 17px; padding: 0; }")
+        self.folder_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.folder_btn.setToolTip(L.t("library.add_folder"))
+        self.folder_btn.clicked.connect(self.folder_requested)
+        self.folder_btn.setVisible(show_tools)
+        header.addWidget(self.folder_btn)
+
+        self.steam_btn = QPushButton(L.t("library.steam"))
+        self.steam_btn.setStyleSheet(tool_style)
+        self.steam_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.steam_btn.setToolTip(L.t("steam.title"))
+        self.steam_btn.clicked.connect(self.steam_requested)
+        self.steam_btn.setVisible(show_tools)
+        header.addWidget(self.steam_btn)
+
         self.search = QLineEdit()
         self.search.setPlaceholderText(L.t("library.search_placeholder"))
-        self.search.setFixedWidth(240)
+        self.search.setFixedWidth(190)
         self.search.setStyleSheet("""
             QLineEdit {
                 background-color: #0F0F0F; color: #FFFFFF;
@@ -1462,10 +2877,20 @@ class LauncherWindow(QMainWindow):
         super().__init__()
         self.config = load_json(CONFIG_PATH, DEFAULT_CONFIG)
         self.cache = load_json(CACHE_PATH, {})
+        self.external = load_json(LIBRARY_PATH, {})
         self.stats = load_json(STATS_PATH, {"play_times": {}})
         self.manifests = {}
         self.cover_pool = QThreadPool()
         self.scanner = None
+        self.steam_thread = None
+        self.steam_dialog = None
+        self.update_thread = None
+        self.update_dialog = None
+        self.latest_release = None
+        self.latest_asset = None
+        self.check_dialog = None
+        self.manual_update_check = False
+        self._steam_syncing = False
         self.extract_worker = None
         self.active_process = None
         self.active_game_key = None
@@ -1498,6 +2923,8 @@ class LauncherWindow(QMainWindow):
         self._initialized = True
         self.sidebar.switch("home")
         self.scan_library()
+        QTimer.singleShot(2500, self._maybe_auto_check_updates)
+        QTimer.singleShot(5000, self._auto_steam_sync)
 
     def _apply_styles(self):
         self.setStyleSheet("""
@@ -1551,18 +2978,22 @@ class LauncherWindow(QMainWindow):
             play_times_getter=lambda: self.stats.get("play_times", {}),
             page_title=L.t("library.title")
         )
-        self.library_page.refresh_btn.clicked.connect(self.scan_library)
+        self.library_page.refresh_btn.clicked.connect(self.refresh_library)
         self.library_page.play_requested.connect(self.play_by_key)
         self.library_page.context_requested.connect(self.show_context_menu)
         self.library_page.favorite_toggled.connect(self.toggle_favorite)
+        self.library_page.add_requested.connect(self.open_add_games)
+        self.library_page.folder_requested.connect(self.open_add_folder)
+        self.library_page.steam_requested.connect(self.open_steam_import)
 
         self.fav_page = LibraryPage(
             self.config,
             favorites_getter=lambda: self.config.get("favorites", []),
             play_times_getter=lambda: self.stats.get("play_times", {}),
-            page_title=L.t("sidebar.favorites")
+            page_title=L.t("sidebar.favorites"),
+            show_tools=False
         )
-        self.fav_page.refresh_btn.clicked.connect(self.scan_library)
+        self.fav_page.refresh_btn.clicked.connect(self.refresh_library)
         self.fav_page.play_requested.connect(self.play_by_key)
         self.fav_page.context_requested.connect(self.show_context_menu)
         self.fav_page.favorite_toggled.connect(self.toggle_favorite)
@@ -1583,6 +3014,21 @@ class LauncherWindow(QMainWindow):
         self.bottom_left = QLabel(L.t("bottom.version"))
         self.bottom_left.setStyleSheet("color: #333333; font-size: 10px; letter-spacing: 0.5px;")
         bl.addWidget(self.bottom_left)
+        bl.addSpacing(12)
+
+        self.update_chip = QPushButton("")
+        self.update_chip.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.update_chip.setVisible(False)
+        self.update_chip.setStyleSheet("""
+            QPushButton {
+                background-color: #FFFFFF; color: #000000;
+                border: none; border-radius: 9px;
+                padding: 3px 12px; font-size: 10px; font-weight: bold;
+            }
+            QPushButton:hover { background-color: #D8D8D8; }
+        """)
+        self.update_chip.clicked.connect(self._open_latest_update)
+        bl.addWidget(self.update_chip)
         bl.addStretch()
         self.bottom_right = QLabel("")
         self.bottom_right.setStyleSheet("color: #333333; font-size: 10px; letter-spacing: 0.5px;")
@@ -1611,9 +3057,16 @@ class LauncherWindow(QMainWindow):
         menu = QMenu()
         show_action = QAction(L.t("tray.show"), self)
         show_action.triggered.connect(self._show_from_tray)
+        check_action = QAction(L.t("tray.check_updates"), self)
+        check_action.triggered.connect(lambda: QTimer.singleShot(150, lambda: self.check_updates(manual=True)))
+        settings_action = QAction(L.t("tray.settings"), self)
+        settings_action.triggered.connect(self.open_settings)
         quit_action = QAction(L.t("tray.quit"), self)
         quit_action.triggered.connect(self._quit_app)
         menu.addAction(show_action)
+        menu.addSeparator()
+        menu.addAction(check_action)
+        menu.addAction(settings_action)
         menu.addSeparator()
         menu.addAction(quit_action)
         self.tray.setContextMenu(menu)
@@ -1695,13 +3148,21 @@ class LauncherWindow(QMainWindow):
         if self.current_page == "favorites":
             self.fav_page.show_skeleton()
 
-        self.scanner = ManifestScanner(games_dir, self.cache)
+        self.scanner = ManifestScanner(games_dir, self.cache, self.external)
         self.scanner.finished.connect(self._on_scan_done)
         self.scanner.start()
 
     def _on_scan_done(self, manifests):
         self.manifests = manifests
-        save_json(CACHE_PATH, manifests)
+        cache_to_save = {}
+        for key, meta in manifests.items():
+            if meta.get("external"):
+                continue
+            entry = dict(meta)
+            entry.pop("cover_data", None)
+            cache_to_save[key] = entry
+        self.cache = cache_to_save
+        save_json(CACHE_PATH, cache_to_save)
         self.library_page.render(manifests)
         self._render_favorites()
         self._update_bottom()
@@ -1725,6 +3186,7 @@ class LauncherWindow(QMainWindow):
     def show_context_menu(self, key, global_pos):
         if key not in self.manifests:
             return
+        meta = self.manifests[key]
         menu = QMenu(self)
         menu.setStyleSheet("""
             QMenu {
@@ -1767,7 +3229,8 @@ class LauncherWindow(QMainWindow):
 
         menu.addSeparator()
 
-        act_delete = QAction(L.t("menu.delete"), self)
+        is_external = bool(meta.get("external"))
+        act_delete = QAction(L.t("menu.remove") if is_external else L.t("menu.delete"), self)
         ic = get_icon_tinted("trash", 16, QColor(255, 107, 107))
         if ic: act_delete.setIcon(ic)
         menu.addAction(act_delete)
@@ -1778,32 +3241,90 @@ class LauncherWindow(QMainWindow):
         elif action == act_fav:
             self.toggle_favorite(key)
         elif action == act_open:
-            if os.name == 'nt':
-                subprocess.Popen(['explorer', '/select,', self.manifests[key]["path"]])
-            elif sys.platform == 'darwin':
-                subprocess.Popen(['open', '-R', self.manifests[key]["path"]])
-            else:
-                subprocess.Popen(['xdg-open', os.path.dirname(self.manifests[key]["path"])])
+            self._open_game_folder(meta)
         elif action == act_rename:
             new_name, ok = QInputDialog.getText(self, L.t("dialog.rename.title"),
                                                 L.t("dialog.rename.prompt"),
-                                                text=self.manifests[key].get("name", ""))
+                                                text=meta.get("name", ""))
             if ok and new_name:
-                self.manifests[key]["name"] = new_name
-                save_json(CACHE_PATH, self.manifests)
-                self.library_page.render(self.manifests)
-                self._render_favorites()
+                self._rename_game(key, new_name)
         elif action == act_delete:
-            r = QMessageBox.question(self, L.t("dialog.delete.title"),
-                                     L.t("dialog.delete.confirm", name=self.manifests[key].get("name")))
-            if r == QMessageBox.StandardButton.Yes:
-                try:
-                    os.remove(self.manifests[key]["path"])
-                    log.info(f"Удалена игра: {key}")
-                    self.scan_library()
-                except Exception as e:
-                    QMessageBox.critical(self, L.t("dialog.delete.title"),
-                                         L.t("dialog.delete.error", error=str(e)))
+            if is_external:
+                self._remove_external_game(key)
+            else:
+                r = QMessageBox.question(self, L.t("dialog.delete.title"),
+                                         L.t("dialog.delete.confirm", name=meta.get("name")))
+                if r == QMessageBox.StandardButton.Yes:
+                    try:
+                        os.remove(meta["path"])
+                        log.info(f"Удалена игра: {key}")
+                        self.scan_library()
+                    except Exception as e:
+                        QMessageBox.critical(self, L.t("dialog.delete.title"),
+                                             L.t("dialog.delete.error", error=str(e)))
+
+    def _rename_game(self, key, new_name):
+        meta = self.manifests[key]
+        meta["name"] = new_name
+        if meta.get("external"):
+            if key in self.external:
+                self.external[key]["name"] = new_name
+                save_json(LIBRARY_PATH, self.external)
+        else:
+            self.cache[key] = meta
+            save_json(CACHE_PATH, self.cache)
+        self.library_page.render(self.manifests)
+        self._render_favorites()
+
+    def _open_game_folder(self, meta):
+        target = meta.get("path") or meta.get("exe") or ""
+        if os.path.isfile(target):
+            folder = os.path.dirname(target)
+        else:
+            folder = target
+        if not folder or not os.path.exists(folder):
+            QMessageBox.information(self, L.t("menu.open_folder"),
+                                    L.t("launch.missing_path", path=target))
+            return
+        if os.name == 'nt':
+            os.startfile(folder)  # type: ignore[attr-defined]
+        elif sys.platform == 'darwin':
+            subprocess.Popen(['open', folder])
+        else:
+            subprocess.Popen(['xdg-open', folder])
+
+    def _remove_external_game(self, key):
+        meta = self.manifests.get(key, {})
+        r = QMessageBox.question(self, L.t("dialog.remove.title"),
+                                 L.t("dialog.remove.confirm", name=meta.get("name", key)))
+        if r != QMessageBox.StandardButton.Yes:
+            return
+        entry = self.external.pop(key, None)
+        if meta.get("type") == "steam":
+            appid = str(meta.get("appid") or key.split(":")[-1])
+            hidden = set(map(str, self.config.get("steam_hidden", [])))
+            hidden.add(appid)
+            self.config["steam_hidden"] = sorted(hidden)
+        favorites = self.config.get("favorites", [])
+        if key in favorites:
+            favorites.remove(key)
+            self.config["favorites"] = favorites
+        save_json(CONFIG_PATH, self.config)
+        save_json(LIBRARY_PATH, self.external)
+        if entry:
+            log.info(f"Игра удалена из библиотеки: {key}")
+        self.scan_library()
+
+    def _guess_type(self, meta):
+        if meta.get("appid"):
+            return "steam"
+        path = meta.get("path", "")
+        ext = os.path.splitext(path)[1].lower()
+        return {
+            ".dvp": "dvp", ".zip": "zip", ".exe": "exe",
+            ".bat": "script", ".cmd": "script",
+            ".lnk": "shortcut", ".url": "shortcut",
+        }.get(ext, "dvp")
 
     def play_by_key(self, key):
         if key not in self.manifests:
@@ -1816,8 +3337,46 @@ class LauncherWindow(QMainWindow):
             QMessageBox.critical(self, L.t("card.error"),
                                  L.t("launch.corrupted", error=meta["error"]))
             return
-        dvp_path = meta["path"]
+
+        game_type = meta.get("type") or self._guess_type(meta)
         name = meta.get("name", "game")
+
+        if game_type == "steam":
+            appid = str(meta.get("appid") or key.split(":")[-1])
+            try:
+                launch_steam_game(appid)
+                self.library_page.status.setText(L.t("launch.steam_launch", name=name))
+                log.info(f"Запуск через Steam: {name} (appid {appid})")
+            except Exception as e:
+                log.exception("Ошибка запуска Steam-игры")
+                QMessageBox.critical(self, L.t("launch.start_error"),
+                                     L.t("launch.steam_error", error=str(e)))
+            return
+
+        if game_type == "folder":
+            folder = meta.get("path", "")
+            exe = meta.get("exe") or detect_executable(folder)
+            if not folder or not os.path.isdir(folder):
+                QMessageBox.critical(self, L.t("launch.start_error"),
+                                     L.t("launch.missing_path", path=folder))
+                return
+            if not exe or not os.path.exists(exe):
+                QMessageBox.critical(self, L.t("launch.start_error"),
+                                     L.t("launch.no_exe", name=name))
+                return
+            self._launch_executable(key, exe, meta)
+            return
+
+        if game_type in ("exe", "script"):
+            target = meta.get("exe") or meta.get("path", "")
+            self._launch_executable(key, target, meta)
+            return
+
+        if game_type == "shortcut":
+            self._launch_shortcut(meta)
+            return
+
+        dvp_path = meta["path"]
         safe = "".join(c for c in name if c.isalnum() or c in "._- ") or "game"
         base_temp = self.config.get("temp_dir", str(CACHE_DIR))
         self.temp_dir = os.path.join(base_temp, safe)
@@ -1835,6 +3394,52 @@ class LauncherWindow(QMainWindow):
         self.extract_worker.status.connect(self.library_page.status.setText)
         self.extract_worker.finished_extract.connect(lambda p, ok, e: self._on_extracted(p, ok, e, meta))
         self.extract_worker.start()
+
+    def _launch_executable(self, key, exe_path, meta, keep_temp=False):
+        name = meta.get("name", "game")
+        if not exe_path or not os.path.exists(exe_path):
+            QMessageBox.critical(self, L.t("launch.start_error"),
+                                 L.t("launch.missing_path", path=exe_path))
+            return
+        try:
+            cwd = os.path.dirname(exe_path) or None
+            flags = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
+            if exe_path.lower().endswith((".bat", ".cmd")):
+                self.active_process = subprocess.Popen(
+                    ["cmd", "/c", exe_path], cwd=cwd, shell=False, creationflags=flags)
+            else:
+                self.active_process = subprocess.Popen(
+                    [exe_path], cwd=cwd, shell=False, creationflags=flags)
+            if not keep_temp:
+                self.temp_dir = None
+            self.active_game_key = key
+            self.game_start_time = time.time()
+            self.library_page.status.setText(L.t("launch.playing", name=name,
+                                                 pid=self.active_process.pid))
+            log.info(f"Запуск: {name} (PID {self.active_process.pid})")
+            QTimer.singleShot(2000, self._check_process)
+        except Exception as e:
+            log.exception("Ошибка запуска")
+            QMessageBox.critical(self, L.t("launch.start_error"), str(e))
+
+    def _launch_shortcut(self, meta):
+        target = meta.get("path", "")
+        name = meta.get("name", "game")
+        if not target or not os.path.exists(target):
+            QMessageBox.critical(self, L.t("launch.start_error"),
+                                 L.t("launch.missing_path", path=target))
+            return
+        try:
+            if os.name == 'nt':
+                os.startfile(target)  # type: ignore[attr-defined]
+            elif sys.platform == 'darwin':
+                subprocess.Popen(["open", target])
+            else:
+                subprocess.Popen(["xdg-open", target])
+            self.library_page.status.setText(L.t("launch.direct", name=name))
+        except Exception as e:
+            log.exception("Ошибка запуска ярлыка")
+            QMessageBox.critical(self, L.t("launch.start_error"), str(e))
 
     def _on_extract_progress(self, value):
         if self.active_game_key:
@@ -1854,32 +3459,29 @@ class LauncherWindow(QMainWindow):
 
         exe_name = meta.get("exe", "")
         exe_path = None
-        for root, _, files in os.walk(self.temp_dir):
-            for f in files:
-                if f.lower() == exe_name.lower():
-                    exe_path = os.path.join(root, f); break
-            if exe_path: break
+        if exe_name:
+            for root, _, files in os.walk(self.temp_dir):
+                for f in files:
+                    if f.lower() == os.path.basename(exe_name).lower():
+                        exe_path = os.path.join(root, f)
+                        break
+                if exe_path:
+                    break
 
         if not exe_path:
-            msg = L.t("launch.exe_missing", exe=exe_name)
+            detected = detect_executable(self.temp_dir)
+            if detected:
+                exe_path = detected
+                log.info(f"Автоопределение exe: {detected}")
+
+        if not exe_path:
+            msg = L.t("launch.no_exe", name=meta.get("name", ""))
             log.error(msg)
             QMessageBox.critical(self, L.t("launch.start_error"), msg)
-            self.library_page.status.setText(L.t("launch.exe_missing", exe=exe_name))
+            self.library_page.status.setText(msg)
             return
 
-        try:
-            self.active_process = subprocess.Popen(
-                [exe_path], cwd=os.path.dirname(exe_path), shell=False,
-                creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
-            )
-            self.game_start_time = time.time()
-            self.library_page.status.setText(L.t("launch.playing", name=meta.get('name'),
-                                                 pid=self.active_process.pid))
-            log.info(f"Запуск: {meta.get('name')} (PID {self.active_process.pid})")
-            QTimer.singleShot(2000, self._check_process)
-        except Exception as e:
-            log.exception("Ошибка запуска")
-            QMessageBox.critical(self, L.t("launch.start_error"), str(e))
+        self._launch_executable(key, exe_path, meta, keep_temp=True)
 
     def _check_process(self):
         if self.active_process is None:
@@ -1900,6 +3502,7 @@ class LauncherWindow(QMainWindow):
                     self.library_page.status.setText(L.t("launch.cleaned"))
                 except Exception as e:
                     log.warning(f"Не удалось очистить: {e}")
+            self.temp_dir = None
             self.active_process = None
             self.active_game_key = None
             self.game_start_time = None
@@ -1909,9 +3512,454 @@ class LauncherWindow(QMainWindow):
         else:
             QTimer.singleShot(2000, self._check_process)
 
+    # ------------------------------------------------------------------
+    #  ADDING GAMES
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _external_key(path: str) -> str:
+        return "local:" + hashlib.sha1(os.path.abspath(path).lower().encode("utf-8", "ignore")).hexdigest()[:12]
+
+    def open_add_games(self):
+        files, _ = QFileDialog.getOpenFileNames(self, L.t("dialog.add.title"), "", L.t("dialog.add.filter"))
+        if files:
+            self._add_paths(files)
+
+    def open_add_folder(self):
+        folder = QFileDialog.getExistingDirectory(self, L.t("dialog.folder.title"))
+        if folder:
+            self._add_paths([folder])
+
+    def _add_paths(self, paths):
+        games_dir = self.config.get("games_dir", str(GAMES_DIR))
+        os.makedirs(games_dir, exist_ok=True)
+        added = 0
+        errors = []
+
+        for p in paths:
+            try:
+                if os.path.isdir(p):
+                    key = self._external_key(p)
+                    if key in self.external:
+                        continue
+                    self.external[key] = {
+                        "type": "folder",
+                        "name": Path(p).name,
+                        "path": p,
+                        "exe": detect_executable(p),
+                        "size": dir_size(p),
+                        "added": time.time(),
+                    }
+                    added += 1
+                    continue
+
+                ext = os.path.splitext(p)[1].lower()
+                if ext not in SUPPORTED_EXTENSIONS:
+                    continue
+
+                if ext in ARCHIVE_EXTENSIONS:
+                    dest = os.path.join(games_dir, os.path.basename(p))
+                    if os.path.abspath(dest) != os.path.abspath(p):
+                        base, suffix = os.path.splitext(dest)
+                        counter = 2
+                        while os.path.exists(dest):
+                            dest = f"{base} ({counter}){suffix}"
+                            counter += 1
+                        shutil.copy2(p, dest)
+                    added += 1
+                else:
+                    key = self._external_key(p)
+                    if key in self.external:
+                        continue
+                    if ext in (".bat", ".cmd"):
+                        game_type = "script"
+                    elif ext in (".lnk", ".url"):
+                        game_type = "shortcut"
+                    else:
+                        game_type = "exe"
+                    self.external[key] = {
+                        "type": game_type,
+                        "name": prettify_name(Path(p).stem),
+                        "path": p,
+                        "exe": p,
+                        "size": os.path.getsize(p),
+                        "added": time.time(),
+                    }
+                    added += 1
+            except Exception as e:
+                log.exception(f"Не удалось добавить {p}")
+                errors.append(f"{os.path.basename(p)}: {e}")
+
+        if added:
+            save_json(LIBRARY_PATH, self.external)
+            self.sidebar.switch("library")
+            self.scan_library()
+            self.library_page.status.setText(L.t("library.added", count=added))
+            log.info(f"Добавлено игр: {added}")
+        if errors:
+            QMessageBox.warning(self, L.t("dialog.add.title"),
+                                L.t("dialog.add.error", error="\n".join(errors[:5])))
+
+    # ------------------------------------------------------------------
+    #  STEAM IMPORT
+    # ------------------------------------------------------------------
+
+    def open_steam_import(self):
+        steam_path = find_steam_path(self.config.get("steam_path", ""))
+        if not steam_path:
+            QMessageBox.information(self, L.t("steam.title"), L.t("steam.not_found"))
+            return
+        dialog = SteamImportDialog(steam_path, list(self.external.keys()), self)
+        self.steam_dialog = dialog
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            self._apply_steam_selection(dialog.games, getattr(dialog, "selected_keys", set()))
+
+    def _apply_steam_selection(self, games, selected_keys):
+        """Adds checked Steam games and removes unchecked ones from the library."""
+        hidden = set(map(str, self.config.get("steam_hidden", [])))
+        added = removed = 0
+
+        for game in games:
+            key = game.get("key")
+            if not key or not game.get("appid"):
+                continue
+            appid = str(game["appid"])
+            if key in selected_keys:
+                hidden.discard(appid)
+                if key in self.external:
+                    entry = self.external[key]
+                    entry.update({
+                        "name": game.get("name", entry.get("name", key)),
+                        "path": game.get("path", entry.get("path", "")),
+                        "size": game.get("size", entry.get("size", 0)),
+                        "cover_path": game.get("cover_path") or entry.get("cover_path", ""),
+                        "cover_url": game.get("cover_url") or entry.get("cover_url", ""),
+                    })
+                else:
+                    self.external[key] = {
+                        "type": "steam",
+                        "appid": appid,
+                        "name": game.get("name", key),
+                        "path": game.get("path", ""),
+                        "size": game.get("size", 0),
+                        "cover_path": game.get("cover_path", ""),
+                        "cover_url": game.get("cover_url", ""),
+                        "added": time.time(),
+                    }
+                    added += 1
+            elif key in self.external:
+                self.external.pop(key, None)
+                hidden.add(appid)
+                removed += 1
+
+        self.config["steam_hidden"] = sorted(hidden)
+        self.config["steam_import_done"] = True
+        save_json(CONFIG_PATH, self.config)
+        save_json(LIBRARY_PATH, self.external)
+        self.scan_library()
+        if added or removed:
+            self.library_page.status.setText(
+                L.t("steam.selection_applied", added=added, removed=removed))
+            log.info(f"Библиотека Steam: +{added} / -{removed}")
+
+    def _add_steam_games(self, games):
+        hidden = set(map(str, self.config.get("steam_hidden", [])))
+        added = 0
+        for game in games:
+            key = game.get("key") or f"steam:{game.get('appid')}"
+            if not game.get("appid") or key in self.external:
+                continue
+            hidden.discard(str(game["appid"]))
+            self.external[key] = {
+                "type": "steam",
+                "appid": str(game["appid"]),
+                "name": game.get("name", key),
+                "path": game.get("path", ""),
+                "size": game.get("size", 0),
+                "cover_path": game.get("cover_path", ""),
+                "cover_url": game.get("cover_url", ""),
+                "added": time.time(),
+            }
+            added += 1
+
+        if added:
+            self.config["steam_hidden"] = sorted(hidden)
+            self.config["steam_import_done"] = True
+            save_json(CONFIG_PATH, self.config)
+            save_json(LIBRARY_PATH, self.external)
+            self.scan_library()
+            self.library_page.status.setText(L.t("steam.added", count=added))
+            log.info(f"Добавлено из Steam: {added}")
+
+    def _auto_steam_sync(self):
+        if not self.config.get("auto_steam_import", True) or self._steam_syncing:
+            return
+        steam_path = find_steam_path(self.config.get("steam_path", ""))
+        if not steam_path:
+            log.info("Steam не найден, автодобавление пропущено")
+            return
+        self._steam_syncing = True
+        self.steam_thread = SteamScanThread(steam_path)
+        self.steam_thread.scanned.connect(self._on_auto_steam)
+        self.steam_thread.start()
+
+    def _on_auto_steam(self, games, error):
+        self._steam_syncing = False
+        if error:
+            log.warning(f"Автоимпорт Steam: {error}")
+            return
+        hidden = set(map(str, self.config.get("steam_hidden", [])))
+        fresh_by_key = {g.get("key"): g for g in games}
+
+        changed = False
+        for key, entry in self.external.items():
+            if entry.get("type") != "steam":
+                continue
+            fresh = fresh_by_key.get(key)
+            if not fresh:
+                continue
+            for field in ("name", "path", "size"):
+                value = fresh.get(field)
+                if value is not None and entry.get(field) != value:
+                    entry[field] = value
+                    changed = True
+            if fresh.get("cover_path"):
+                if entry.get("cover_path") != fresh["cover_path"]:
+                    entry["cover_path"] = fresh["cover_path"]
+                    changed = True
+            elif fresh.get("cover_url") and entry.get("cover_url") != fresh["cover_url"]:
+                entry["cover_url"] = fresh["cover_url"]
+                changed = True
+
+        new_games = [
+            g for g in games
+            if g.get("key") not in self.external and str(g.get("appid", "")) not in hidden
+        ]
+
+        if new_games:
+            log.info(f"Автодобавление игр Steam: {len(new_games)}")
+            self._add_steam_games(new_games)
+        elif changed:
+            save_json(LIBRARY_PATH, self.external)
+            self.scan_library()
+        elif not self.config.get("steam_import_done", False):
+            self.config["steam_import_done"] = True
+            save_json(CONFIG_PATH, self.config)
+
+    def refresh_library(self):
+        self.scan_library()
+        QTimer.singleShot(500, self._auto_steam_sync)
+
+    # ------------------------------------------------------------------
+    #  UPDATES
+    # ------------------------------------------------------------------
+
+    def _maybe_auto_check_updates(self):
+        if not self.config.get("check_updates", True):
+            return
+        try:
+            last = float(self.config.get("last_update_check", 0) or 0)
+        except (TypeError, ValueError):
+            last = 0
+        if time.time() - last < UPDATE_CHECK_INTERVAL:
+            return
+        self.check_updates(manual=False)
+
+    def check_updates(self, manual=True):
+        if self.update_thread and self.update_thread.isRunning():
+            if self.check_dialog is not None:
+                self.check_dialog.raise_()
+                self.check_dialog.activateWindow()
+            return
+        self.manual_update_check = manual
+        if manual:
+            self.library_page.status.setText(L.t("update.checking"))
+            self._open_check_dialog()
+        self.update_thread = UpdateCheckThread()
+        self.update_thread.checked.connect(self._on_update_checked)
+        self.update_thread.start()
+
+    def _open_check_dialog(self):
+        if self.check_dialog is not None:
+            self.check_dialog.raise_()
+            return
+        dialog = UpdateCheckDialog(self)
+        dialog.adjustSize()
+        center = self.frameGeometry().center() - dialog.rect().center()
+        dialog.move(center)
+        dialog.show()
+        self.check_dialog = dialog
+
+    def _close_check_dialog(self):
+        if self.check_dialog is None:
+            return
+        self.check_dialog.close()
+        self.check_dialog.deleteLater()
+        self.check_dialog = None
+
+    def _show_update_info(self, title, message, detail="", retry=False, page_url="", manual=True):
+        dialog = UpdateInfoDialog(
+            title, message, detail=detail,
+            primary_text=L.t("update.retry") if retry else L.t("update.close"),
+            retry=retry,
+            secondary_text=L.t("update.close") if retry else None,
+            page_url=page_url,
+            parent=self,
+        )
+        dialog.exec()
+        if dialog.retry_requested:
+            QTimer.singleShot(200, lambda: self.check_updates(manual=manual))
+
+    def _on_update_checked(self, release, error):
+        self._close_check_dialog()
+        self.config["last_update_check"] = int(time.time())
+        save_json(CONFIG_PATH, self.config)
+        manual = self.manual_update_check
+        self.manual_update_check = False
+
+        if error:
+            log.warning(f"Проверка обновлений не удалась: {error}")
+            if manual:
+                self._show_update_info(L.t("update.error_title"),
+                                       L.t("update.check_failed", error=error),
+                                       detail=L.t("update.check_hint"),
+                                       retry=True, page_url=GITHUB_RELEASES_PAGE)
+            return
+
+        tag = str(release.get("tag_name") or "")
+        if not tag or not is_newer_version(tag, VERSION):
+            log.info(f"Обновлений нет (последняя: {tag or '?'}, текущая: {VERSION})")
+            if manual:
+                self._show_update_info(L.t("update.up_to_date_title"),
+                                       L.t("update.up_to_date", version=VERSION),
+                                       detail=L.t("update.current_version", version=VERSION),
+                                       retry=True)
+            return
+
+        log.info(f"Доступно обновление: {tag}")
+        self.latest_release = release
+        self.latest_asset = pick_update_asset(release.get("assets") or [])
+        self.update_chip.setText(L.t("update.chip", version=tag))
+        self.update_chip.setVisible(True)
+        if self.tray.isVisible():
+            self.tray.showMessage(L.t("update.tray_title"),
+                                  L.t("update.tray_msg", version=tag),
+                                  QSystemTrayIcon.MessageIcon.Information, 5000)
+        self._show_update_dialog(release, self.latest_asset)
+
+    def _open_latest_update(self):
+        if self.latest_release:
+            self._show_update_dialog(self.latest_release, getattr(self, "latest_asset", None))
+
+    def _show_update_dialog(self, release, asset=None):
+        if self.update_dialog is not None and self.update_dialog.isVisible():
+            self.update_dialog.raise_()
+            return
+        dialog = UpdateDialog(release, asset, self)
+        dialog.install_requested.connect(self._install_update)
+        self.update_dialog = dialog
+        dialog.exec()
+
+    def _install_update(self, archive_path):
+        archive = Path(archive_path)
+        if not archive.exists():
+            QMessageBox.critical(self, L.t("update.title"),
+                                 L.t("update.download_error", error=str(archive)))
+            return
+        if not getattr(sys, "frozen", False):
+            self._open_path(archive.parent)
+            QMessageBox.information(self, L.t("update.title"),
+                                    L.t("update.source_mode", path=str(archive)))
+            return
+        if os.name != "nt":
+            self._open_path(archive)
+            page = (self.latest_release or {}).get("html_url") or GITHUB_RELEASES_PAGE
+            webbrowser.open(page)
+            return
+        try:
+            script = self._prepare_windows_update(archive)
+            flags = 0
+            for flag in ("DETACHED_PROCESS", "CREATE_NEW_PROCESS_GROUP", "CREATE_NO_WINDOW"):
+                flags |= getattr(subprocess, flag, 0)
+            subprocess.Popen(["cmd", "/c", str(script)], creationflags=flags, close_fds=True)
+            log.info(f"Установка обновления запущена: {script}")
+            self.tray.hide()
+            self.hide()
+            QTimer.singleShot(400, QApplication.quit)
+        except Exception as e:
+            log.exception("Не удалось запустить установку обновления")
+            QMessageBox.critical(self, L.t("update.title"),
+                                 L.t("update.apply_error", error=str(e)))
+
+    def _prepare_windows_update(self, archive: Path) -> Path:
+        """Extracts the downloaded build, then writes a script that swaps files
+        after the launcher exits and restarts it."""
+        staging = UPDATES_DIR / "staging"
+        if staging.exists():
+            shutil.rmtree(staging, ignore_errors=True)
+        staging.mkdir(parents=True, exist_ok=True)
+
+        exe_name = Path(sys.executable).name
+        if archive.suffix.lower() == ".zip":
+            with zipfile.ZipFile(archive) as zf:
+                root = staging.resolve()
+                for info in zf.infolist():
+                    target = (staging / info.filename).resolve()
+                    if not str(target).startswith(str(root)):
+                        log.warning(f"Пропущен подозрительный путь в архиве: {info.filename}")
+                        continue
+                    zf.extract(info, staging)
+        elif archive.suffix.lower() in (".exe", ".msi"):
+            shutil.copy2(archive, staging / exe_name)
+        else:
+            raise ValueError(f"Unsupported update package: {archive.suffix}")
+
+        payload_exe = None
+        for candidate in (staging / exe_name, staging / "Devers Launcher.exe"):
+            if candidate.exists():
+                payload_exe = candidate
+                break
+        if payload_exe is None:
+            found = detect_executable(staging)
+            if found:
+                payload_exe = Path(found)
+        if payload_exe is None:
+            raise FileNotFoundError("Launcher executable not found in update package")
+
+        source_dir = payload_exe.parent
+        target_exe = BASE_DIR / payload_exe.name
+        bat = UPDATES_DIR / "apply_update.bat"
+        content = (
+            "@echo off\r\n"
+            "setlocal\r\n"
+            f'powershell -NoProfile -WindowStyle Hidden -Command "Wait-Process -Id {os.getpid()} -ErrorAction SilentlyContinue"\r\n'
+            f'xcopy "{source_dir}\\*" "{BASE_DIR}\\" /E /Y /I >NUL\r\n'
+            f'start "" "{target_exe}"\r\n'
+            f'rmdir /S /Q "{staging}"\r\n'
+            'del "%~f0"\r\n'
+        )
+        try:
+            with open(bat, "w", encoding="mbcs", errors="replace", newline="") as f:
+                f.write(content)
+        except LookupError:
+            with open(bat, "w", encoding="cp1251", errors="replace", newline="") as f:
+                f.write(content)
+        log.info(f"Скрипт обновления: {bat}")
+        return bat
+
+    def _open_path(self, path):
+        p = str(path)
+        if os.name == 'nt':
+            os.startfile(p)  # type: ignore[attr-defined]
+        elif sys.platform == 'darwin':
+            subprocess.Popen(['open', p])
+        else:
+            subprocess.Popen(['xdg-open', p])
+
     def open_settings(self):
         d = SettingsDialog(self.config, self)
         d.settings_applied.connect(self._on_settings)
+        d.check_updates_requested.connect(lambda: QTimer.singleShot(500, lambda: self.check_updates(manual=True)))
         d.exec()
 
     def _on_settings(self, new_conf):
@@ -1927,6 +3975,7 @@ class LauncherWindow(QMainWindow):
             self.fav_page.config = new_conf
             self.scan_library()
             self._update_bottom()
+            QTimer.singleShot(800, self._auto_steam_sync)
 
     def _restart_with_new_language(self):
         L.set_language(self.config.get("language", "en"))
@@ -1945,29 +3994,20 @@ class LauncherWindow(QMainWindow):
             pass
 
     def open_about(self):
-        AboutDialog(self).exec()
+        dialog = AboutDialog(self)
+        dialog.exec()
+        if dialog.check_requested:
+            QTimer.singleShot(200, lambda: self.check_updates(manual=True))
 
     def dragEnterEvent(self, event):
         if event.mimeData().hasUrls():
             event.acceptProposedAction()
 
     def dropEvent(self, event):
-        games_dir = self.config.get("games_dir", str(GAMES_DIR))
-        os.makedirs(games_dir, exist_ok=True)
-        added = 0
-        for url in event.mimeData().urls():
-            p = url.toLocalFile()
-            if p.lower().endswith(".dvp"):
-                try:
-                    dest = os.path.join(games_dir, os.path.basename(p))
-                    shutil.copy(p, dest)
-                    added += 1
-                except Exception as e:
-                    log.error(f"Не удалось скопировать {p}: {e}")
-        if added:
-            log.info(f"Добавлено игр: {added}")
-            self.sidebar.switch("library")
-            self.scan_library()
+        paths = [u.toLocalFile() for u in event.mimeData().urls() if u.toLocalFile()]
+        if paths:
+            event.acceptProposedAction()
+            self._add_paths(paths)
 
 
 _new_window = None
