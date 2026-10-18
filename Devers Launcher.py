@@ -1,4 +1,4 @@
-VERSION = "1.3"
+VERSION = "1.4"
 
 import sys
 import os
@@ -23,12 +23,13 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QLineEdit, QDialogButtonBox, QCheckBox,
                              QFileDialog, QMenu, QSystemTrayIcon, QComboBox,
                              QGraphicsOpacityEffect, QSizePolicy, QGridLayout,
-                             QInputDialog)
+                             QInputDialog, QStackedWidget)
 from PyQt6.QtCore import (Qt, QThread, pyqtSignal, QTimer, QSize, QPropertyAnimation, 
                           QEasingCurve, QParallelAnimationGroup, QRunnable, QThreadPool,
                           QObject, QPoint)
 from PyQt6.QtGui import (QMovie, QPixmap, QIcon, QAction, QKeySequence, QShortcut,
-                         QPainter, QColor, QBrush, QFont, QImage, QPainterPath)
+                         QPainter, QColor, QBrush, QFont, QImage, QPainterPath,
+                         QFontMetrics)
 
 
 def get_base_dir() -> Path:
@@ -161,6 +162,9 @@ DEFAULT_CONFIG = {
     "language": "en",
     "check_updates": True,
     "last_update_check": 0,
+    "animations": True,
+    "animation_style": "slide",
+    "animation_speed": "normal",
     "auto_steam_import": True,
     "steam_path": "",
     "steam_hidden": [],
@@ -219,6 +223,7 @@ EN_DEFAULT = {
     "library.sort.time": "By playtime",
     "library.sort.favorites": "Favorites first",
     "library.empty": "Library is empty.\nDrag .dvp, .zip, .exe files, shortcuts or folders into the window,\nor add them with the 'Add game' button.",
+    "favorites.empty": "Favorites are empty.\nClick the star on any game card to add it here.",
     "library.found": "Found games: {count}",
     "library.not_played": "not played yet",
     "library.add_game": "Add game",
@@ -279,9 +284,20 @@ EN_DEFAULT = {
     "settings.section.steam": "STEAM",
     "settings.section.updates": "UPDATES",
     "settings.section.cache": "IMAGE CACHE",
+    "settings.section.animations": "ANIMATIONS",
+    "settings.animations": "Enable smooth interface animations",
+    "settings.animation_style": "Transition style:",
+    "settings.animation_style.slide": "Slide",
+    "settings.animation_style.fade": "Fade",
+    "settings.animation_speed": "Animation speed:",
+    "settings.animation_speed.fast": "Fast",
+    "settings.animation_speed.normal": "Normal",
+    "settings.animation_speed.smooth": "Smooth",
+    "settings.animations_hint": "Page transitions, card appearance and dialogs.",
     "settings.games_dir": "Games folder:",
     "settings.temp_info": "Folder: {path}\nUsed: {size}",
     "settings.open_folder": "Open folder",
+    "settings.browse": "Choose folder…",
     "settings.clear_now": "Clear now",
     "settings.auto_cleanup": "Automatically clean temp files",
     "settings.show_ext": "Show file extensions",
@@ -364,6 +380,7 @@ EN_DEFAULT = {
     "tray.minimized_msg": "Minimized to tray",
 
     "bottom.temp": "Temp files: {size}",
+    "bottom.stats": "{games} games  •  {steam} from Steam",
     "bottom.version": f"Devers Launcher v{VERSION}",
 }
 
@@ -516,6 +533,66 @@ def save_json(path, data):
             json.dump(data, f, indent=4, ensure_ascii=False)
     except Exception as e:
         log.error(f"Не удалось сохранить {path}: {e}")
+
+
+ANIMATION_SPEEDS = {"fast": 0.65, "normal": 1.0, "smooth": 1.5}
+ANIMATION_STYLES = ("slide", "fade")
+
+
+class AnimationManager:
+    """Central switch for interface animations (enable / speed / style)."""
+
+    def __init__(self):
+        self.enabled_animations = True
+        self.speed = "normal"
+        self.style = "slide"
+
+    def configure(self, config):
+        self.enabled_animations = bool(config.get("animations", True))
+        speed = str(config.get("animation_speed", "normal"))
+        self.speed = speed if speed in ANIMATION_SPEEDS else "normal"
+        style = str(config.get("animation_style", "slide"))
+        self.style = style if style in ANIMATION_STYLES else "slide"
+
+    def enabled(self) -> bool:
+        return self.enabled_animations
+
+    def duration(self, base_ms: int) -> int:
+        if not self.enabled_animations:
+            return 0
+        return max(60, int(base_ms * ANIMATION_SPEEDS.get(self.speed, 1.0)))
+
+
+ANIM = AnimationManager()
+
+
+def fade_in_widget(widget, base_duration=200, delay=0, start=0.0):
+    """Smoothly fades a widget in by animating its opacity effect."""
+    if widget is None or not ANIM.enabled():
+        return None
+    effect = QGraphicsOpacityEffect(widget)
+    effect.setOpacity(start)
+    widget.setGraphicsEffect(effect)
+    anim = QPropertyAnimation(effect, b"opacity", widget)
+    anim.setDuration(ANIM.duration(base_duration))
+    anim.setStartValue(start)
+    anim.setEndValue(1.0)
+    anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+
+    def cleanup():
+        try:
+            if widget.graphicsEffect() is effect:
+                widget.setGraphicsEffect(None)
+        except Exception:
+            pass
+
+    anim.finished.connect(cleanup)
+    widget._fade_animation = anim
+    if delay > 0:
+        QTimer.singleShot(delay, anim.start)
+    else:
+        anim.start()
+    return anim
 
 
 def human_size(bytes_val):
@@ -1036,6 +1113,46 @@ def launch_steam_game(appid: str) -> None:
         subprocess.Popen(["xdg-open", url])
 
 
+def snapshot_pids():
+    """Return {pid: lowercased_name} of currently running processes (best-effort).
+
+    Used to track play-time for games launched without a Popen handle
+    (Steam / shortcuts), where we cannot poll a single process directly.
+    Returns an empty dict on any failure.
+    """
+    procs = {}
+    try:
+        if os.name == "nt":
+            out = subprocess.run(["tasklist", "/FO", "CSV", "/NH"],
+                                 capture_output=True, text=True,
+                                 creationflags=subprocess.CREATE_NO_WINDOW)
+            for line in out.stdout.splitlines():
+                parts = line.split(",")
+                if len(parts) >= 2:
+                    name = parts[0].strip('"').lower()
+                    pid = parts[1].strip('"')
+                    if pid.isdigit():
+                        procs[int(pid)] = name
+        else:
+            out = subprocess.run(["ps", "-A", "-o", "pid=,comm="],
+                                 capture_output=True, text=True)
+            for line in out.stdout.splitlines():
+                parts = line.split(None, 1)
+                if len(parts) == 2 and parts[0].strip().isdigit():
+                    procs[int(parts[0])] = parts[1].strip().lower()
+    except Exception:
+        return {}
+    return procs
+
+
+# Processes that are not the game itself; they appear whenever Steam (or the
+# OS) reacts to a launch and must not keep a play session "alive".
+_LAUNCH_NOISE = (
+    "steam", "webhelper", "conhost", "cmd.exe", "explorer.exe",
+    "searchindexer", "runtimebroker", "svchost", "dwm.exe", "taskhost",
+)
+
+
 # ---------------------------------------------------------------------------
 #  UPDATES (GitHub releases)
 # ---------------------------------------------------------------------------
@@ -1364,8 +1481,26 @@ class CoverLoader(QRunnable):
 
 
 CARD_WIDTH = 240
-CARD_HEIGHT = 300
-COVER_HEIGHT = 175
+CARD_HEIGHT = 256
+COVER_HEIGHT = 172
+
+BADGE_LABELS = {
+    "steam": "STEAM",
+    "exe": "EXE",
+    "zip": "ZIP",
+    "dvp": "DVP",
+    "folder": "FOLDER",
+    "shortcut": "LINK",
+    "script": "BAT",
+}
+
+
+def badge_style(kind: str) -> str:
+    if kind == "steam":
+        return ("background-color: rgba(18, 34, 58, 215); color: #8EC2FF; "
+                "border: 1px solid rgba(120, 175, 255, 110);")
+    return ("background-color: rgba(10, 10, 10, 205); color: #E6E6E6; "
+            "border: 1px solid rgba(255, 255, 255, 45);")
 
 
 class GameCard(QFrame):
@@ -1373,12 +1508,16 @@ class GameCard(QFrame):
     context_menu_requested = pyqtSignal(str, QPoint)
     favorite_toggled = pyqtSignal(str)
 
-    def __init__(self, key, meta, is_favorite=False, show_ext=False, play_time=0):
+    def __init__(self, key, meta, is_favorite=False, show_ext=False, play_time=0,
+                 launch_count=0, width=CARD_WIDTH):
         super().__init__()
         self.key = key
         self.meta = meta
+        self._play_time = play_time
+        self._launch_count = launch_count
+        self._card_width = max(180, int(width))
         self.setObjectName("GameCard")
-        self.setFixedSize(CARD_WIDTH, CARD_HEIGHT)
+        self.setFixedSize(self._card_width, CARD_HEIGHT)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
 
         self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
@@ -1406,6 +1545,45 @@ class GameCard(QFrame):
         elif meta.get("cover_path") or meta.get("cover_url") or meta.get("cover_data"):
             QThreadPool.globalInstance().start(self._make_cover_loader(meta))
 
+        self.badge = QLabel(self.cover)
+        self.badge.setText(BADGE_LABELS.get(str(meta.get("type", "")), ""))
+        self.badge.setStyleSheet(
+            f"{badge_style(str(meta.get('type', '')))}"
+            "border-radius: 7px; padding: 3px 8px; font-size: 9px; font-weight: bold;"
+            "letter-spacing: 1px;"
+        )
+        self.badge.setVisible(bool(self.badge.text()))
+        self.badge.adjustSize()
+        self.badge.move(10, 10)
+        if self.badge.isVisible():
+            self.badge.raise_()
+
+        self.play_overlay = QPushButton(self.cover)
+        self.play_overlay.setFixedSize(56, 56)
+        self.play_overlay.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.play_overlay.setToolTip(L.t("menu.play"))
+        self.play_overlay.setStyleSheet("""
+            QPushButton {
+                background-color: rgba(0, 0, 0, 175);
+                border: 1px solid rgba(255, 255, 255, 70);
+                border-radius: 28px;
+            }
+            QPushButton:hover { background-color: rgba(255, 255, 255, 235); }
+        """)
+        overlay_icon = get_icon("play", 22)
+        if overlay_icon:
+            self.play_overlay.setIcon(overlay_icon)
+            self.play_overlay.setIconSize(QSize(22, 22))
+        else:
+            self.play_overlay.setText("▶")
+        self.play_overlay.clicked.connect(lambda: self.play_requested.emit(self.key))
+        self._overlay_effect = QGraphicsOpacityEffect(self.play_overlay)
+        self._overlay_effect.setOpacity(0.0)
+        self.play_overlay.setGraphicsEffect(self._overlay_effect)
+        self.play_overlay.setVisible(False)
+        self._overlay_anim = QPropertyAnimation(self._overlay_effect, b"opacity", self)
+        self._overlay_anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+
         outer.addWidget(self.cover)
 
         info_wrap = QWidget()
@@ -1414,8 +1592,8 @@ class GameCard(QFrame):
             "border-bottom-left-radius: 12px; border-bottom-right-radius: 12px;"
         )
         info = QVBoxLayout(info_wrap)
-        info.setContentsMargins(14, 10, 14, 12)
-        info.setSpacing(6)
+        info.setContentsMargins(14, 9, 14, 10)
+        info.setSpacing(5)
 
         top_row = QHBoxLayout()
         top_row.setSpacing(6)
@@ -1425,7 +1603,8 @@ class GameCard(QFrame):
             suffix = os.path.splitext(meta.get("path", ""))[1]
             if suffix:
                 display_name = f"{display_name}{suffix}"
-        self.name_label = QLabel(display_name)
+        self._full_name = display_name
+        self.name_label = QLabel(self._elided_name(display_name))
         self.name_label.setToolTip(display_name)
         self.name_label.setStyleSheet(
             "color: #FFFFFF; font-size: 13px; font-weight: bold; "
@@ -1442,22 +1621,21 @@ class GameCard(QFrame):
         self.fav_btn.clicked.connect(lambda: self.favorite_toggled.emit(self.key))
         top_row.addWidget(self.fav_btn)
 
+        info.addStretch(1)
         info.addLayout(top_row)
 
-        size_display = human_size(meta.get("size", 0))
-        time_display = human_time(play_time) if play_time else L.t("library.not_played")
-
-        stats = QLabel(f"{size_display}  •  {time_display}")
-        stats.setStyleSheet("color: #666666; font-size: 10px; background: transparent;")
-        info.addWidget(stats)
-
-        info.addStretch()
+        self.stats_label = QLabel(self._stats_text())
+        self.stats_label.setStyleSheet("color: #666666; font-size: 10px; background: transparent;")
+        info.addWidget(self.stats_label)
+        info.addStretch(1)
 
         self.progress = QProgressBar()
         self.progress.setRange(0, 100)
         self.progress.setValue(0)
         self.progress.setVisible(False)
         self.progress.setFixedHeight(14)
+        self._progress_anim = QPropertyAnimation(self.progress, b"value", self)
+        self._progress_anim.setEasingCurve(QEasingCurve.Type.OutCubic)
         self.progress.setStyleSheet("""
             QProgressBar {
                 background-color: #1A1A1A; border: none;
@@ -1504,11 +1682,101 @@ class GameCard(QFrame):
         loader.signals.loaded.connect(self._on_cover_loaded)
         return loader
 
+    def _stats_text(self) -> str:
+        parts = [human_size(self.meta.get("size", 0))]
+        parts.append(human_time(self._play_time) if self._play_time else L.t("library.not_played"))
+        if self._launch_count:
+            parts.append(f"×{self._launch_count}")
+        return "  •  ".join(parts)
+
+    def update_stats(self, play_time=None, launch_count=None):
+        """Refresh the stats line in place (cheap; avoids a full re-render)."""
+        if play_time is not None:
+            self._play_time = play_time
+        if launch_count is not None:
+            self._launch_count = launch_count
+        self.stats_label.setText(self._stats_text())
+
+    def set_card_width(self, width):
+        """Resize a card in place when the grid columns change."""
+        width = max(180, int(width))
+        if width == self._card_width:
+            return
+        self._card_width = width
+        self.setFixedWidth(width)
+        self.name_label.setText(self._elided_name(self._full_name))
+        self._center_overlay()
+
+    def _elided_name(self, text: str) -> str:
+        try:
+            fm = QFontMetrics(self.font())
+        except Exception:
+            return text
+        return fm.elidedText(text, Qt.TextElideMode.ElideRight, self._card_width - 100)
+
     def _on_cover_loaded(self, key, image):
         if key != self.key or image.isNull():
             return
         self.cover.set_rounded_pixmap(QPixmap.fromImage(image))
         self.cover.setText("")
+
+    def set_progress_value(self, value):
+        """Smoothly animates the extraction progress bar."""
+        if not ANIM.enabled():
+            self.progress.setValue(value)
+            return
+        self._progress_anim.stop()
+        self._progress_anim.setDuration(ANIM.duration(260))
+        self._progress_anim.setStartValue(self.progress.value())
+        self._progress_anim.setEndValue(value)
+        self._progress_anim.start()
+
+    def _set_overlay_visible(self, visible):
+        if not ANIM.enabled():
+            self._overlay_effect.setOpacity(1.0 if visible else 0.0)
+            self.play_overlay.setVisible(visible)
+            return
+        self._overlay_anim.stop()
+        if visible:
+            self.play_overlay.setVisible(True)
+            self.play_overlay.raise_()
+            self._overlay_anim.setDuration(ANIM.duration(160))
+            self._overlay_anim.setStartValue(self._overlay_effect.opacity())
+            self._overlay_anim.setEndValue(1.0)
+        else:
+            self._overlay_anim.setDuration(ANIM.duration(140))
+            self._overlay_anim.setStartValue(self._overlay_effect.opacity())
+            self._overlay_anim.setEndValue(0.0)
+            self._overlay_anim.finished.connect(self._hide_overlay_if_faded)
+        self._overlay_anim.start()
+
+    def _hide_overlay_if_faded(self):
+        try:
+            self._overlay_anim.finished.disconnect(self._hide_overlay_if_faded)
+        except Exception:
+            pass
+        if self._overlay_effect.opacity() < 0.05:
+            self.play_overlay.setVisible(False)
+
+    def _center_overlay(self):
+        self.play_overlay.move(
+            (self.cover.width() - self.play_overlay.width()) // 2,
+            (self.cover.height() - self.play_overlay.height()) // 2,
+        )
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if hasattr(self, "play_overlay"):
+            self._center_overlay()
+
+    def enterEvent(self, event):
+        super().enterEvent(event)
+        self._center_overlay()
+        self._set_overlay_visible(True)
+
+    def leaveEvent(self, event):
+        super().leaveEvent(event)
+        self._set_overlay_visible(False)
 
     def _on_context(self, pos):
         self.context_menu_requested.emit(self.key, self.mapToGlobal(pos))
@@ -1666,18 +1934,23 @@ class CollapsibleSidebar(QFrame):
     def toggle(self):
         self.is_collapsed = not self.is_collapsed
         target = self.COLLAPSED if self.is_collapsed else self.EXPANDED
+        duration = ANIM.duration(260)
 
-        a1 = QPropertyAnimation(self, b"minimumWidth")
-        a1.setDuration(260); a1.setStartValue(self.width()); a1.setEndValue(target)
-        a1.setEasingCurve(QEasingCurve.Type.InOutCubic)
-        a2 = QPropertyAnimation(self, b"maximumWidth")
-        a2.setDuration(260); a2.setStartValue(self.width()); a2.setEndValue(target)
-        a2.setEasingCurve(QEasingCurve.Type.InOutCubic)
+        if duration <= 0:
+            self.setMinimumWidth(target)
+            self.setMaximumWidth(target)
+        else:
+            a1 = QPropertyAnimation(self, b"minimumWidth")
+            a1.setDuration(duration); a1.setStartValue(self.width()); a1.setEndValue(target)
+            a1.setEasingCurve(QEasingCurve.Type.InOutCubic)
+            a2 = QPropertyAnimation(self, b"maximumWidth")
+            a2.setDuration(duration); a2.setStartValue(self.width()); a2.setEndValue(target)
+            a2.setEasingCurve(QEasingCurve.Type.InOutCubic)
 
-        g = QParallelAnimationGroup()
-        g.addAnimation(a1); g.addAnimation(a2)
-        g.start()
-        self._anim_group = g
+            g = QParallelAnimationGroup()
+            g.addAnimation(a1); g.addAnimation(a2)
+            g.start()
+            self._anim_group = g
 
         self.logo.setVisible(not self.is_collapsed)
         for k, btn in self.nav_buttons.items():
@@ -1722,7 +1995,15 @@ class SkeletonCard(QFrame):
         layout.addWidget(bottom)
 
 
-class SettingsDialog(QDialog):
+class FadeInDialog(QDialog):
+    """Dialog that fades in smoothly when opened (respects animation settings)."""
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        fade_in_widget(self, 190)
+
+
+class SettingsDialog(FadeInDialog):
     settings_applied = pyqtSignal(dict)
     check_updates_requested = pyqtSignal()
 
@@ -1731,7 +2012,7 @@ class SettingsDialog(QDialog):
         self.config = config.copy()
         self.setWindowTitle(L.t("settings.title"))
         self.setWindowIcon(QApplication.windowIcon())
-        self.resize(600, 800)
+        self.resize(620, 820)
         self.setStyleSheet("""
             QDialog { background-color: #0A0A0A; }
             QLabel { color: #CCCCCC; font-size: 13px; }
@@ -1747,6 +2028,7 @@ class SettingsDialog(QDialog):
             QPushButton:hover { background-color: #E0E0E0; }
             QPushButton#Secondary { background-color: #1A1A1A; color: #FFFFFF; border: 1px solid #333333; }
             QPushButton#Secondary:hover { background-color: #2A2A2A; }
+            QPushButton#Compact { padding: 0; font-size: 15px; }
             QPushButton#Danger { background-color: #1A1A1A; color: #FF6B6B; border: 1px solid #3A1A1A; }
             QPushButton#Danger:hover { background-color: #3A1A1A; }
             QScrollArea { background: transparent; border: none; }
@@ -1786,8 +2068,8 @@ class SettingsDialog(QDialog):
 
         games_row = QHBoxLayout()
         self.games_input = QLineEdit(self.config.get("games_dir", str(GAMES_DIR)))
-        b = QPushButton("..."); b.setObjectName("Secondary"); b.setFixedWidth(45)
-        b.clicked.connect(self._browse)
+        self.games_input.setCursorPosition(0)
+        b = self._browse_button(self._browse)
         games_row.addWidget(self.games_input); games_row.addWidget(b)
         row = QHBoxLayout(); lbl = QLabel(L.t("settings.games_dir")); lbl.setFixedWidth(150)
         row.addWidget(lbl); row.addLayout(games_row); layout.addLayout(row)
@@ -1796,6 +2078,7 @@ class SettingsDialog(QDialog):
         sec2 = QLabel(L.t("settings.section.temp")); sec2.setObjectName("SectionTitle"); layout.addWidget(sec2)
 
         self.temp_label = QLabel(""); self.temp_label.setStyleSheet("color: #888888; font-size: 12px;")
+        self.temp_label.setWordWrap(True)
         layout.addWidget(self.temp_label)
         self._update_temp()
 
@@ -1830,8 +2113,8 @@ class SettingsDialog(QDialog):
         detected = find_steam_path(self.config.get("steam_path", ""))
         self.steam_input = QLineEdit(str(detected) if detected else self.config.get("steam_path", ""))
         self.steam_input.setPlaceholderText(L.t("settings.steam_missing"))
-        sb = QPushButton("..."); sb.setObjectName("Secondary"); sb.setFixedWidth(45)
-        sb.clicked.connect(self._browse_steam)
+        self.steam_input.setCursorPosition(0)
+        sb = self._browse_button(self._browse_steam)
         steam_row.addWidget(self.steam_input); steam_row.addWidget(sb)
         row_steam = QHBoxLayout(); lbl_steam = QLabel(L.t("settings.steam_path")); lbl_steam.setFixedWidth(150)
         row_steam.addWidget(lbl_steam); row_steam.addLayout(steam_row); layout.addLayout(row_steam)
@@ -1852,12 +2135,47 @@ class SettingsDialog(QDialog):
         sec_cache = QLabel(L.t("settings.section.cache")); sec_cache.setObjectName("SectionTitle"); layout.addWidget(sec_cache)
 
         self.covers_label = QLabel(""); self.covers_label.setStyleSheet("color: #888888; font-size: 12px;")
+        self.covers_label.setWordWrap(True)
         layout.addWidget(self.covers_label)
         self._update_covers()
 
         covers_row = QHBoxLayout()
         cc = QPushButton(L.t("settings.clear_covers")); cc.setObjectName("Danger"); cc.clicked.connect(self._clear_covers)
         covers_row.addWidget(cc); covers_row.addStretch(); layout.addLayout(covers_row)
+
+        layout.addSpacing(10)
+        sec_anim = QLabel(L.t("settings.section.animations")); sec_anim.setObjectName("SectionTitle"); layout.addWidget(sec_anim)
+
+        self.animations_cb = QCheckBox(L.t("settings.animations"))
+        self.animations_cb.setChecked(self.config.get("animations", True))
+        layout.addWidget(self.animations_cb)
+
+        anim_style_row = QHBoxLayout()
+        lbl_astyle = QLabel(L.t("settings.animation_style")); lbl_astyle.setFixedWidth(150)
+        self.anim_style_combo = QComboBox()
+        self.anim_style_combo.addItem(L.t("settings.animation_style.slide"), "slide")
+        self.anim_style_combo.addItem(L.t("settings.animation_style.fade"), "fade")
+        self._select_combo_value(self.anim_style_combo, self.config.get("animation_style", "slide"))
+        anim_style_row.addWidget(lbl_astyle); anim_style_row.addWidget(self.anim_style_combo)
+        layout.addLayout(anim_style_row)
+
+        anim_speed_row = QHBoxLayout()
+        lbl_aspeed = QLabel(L.t("settings.animation_speed")); lbl_aspeed.setFixedWidth(150)
+        self.anim_speed_combo = QComboBox()
+        self.anim_speed_combo.addItem(L.t("settings.animation_speed.fast"), "fast")
+        self.anim_speed_combo.addItem(L.t("settings.animation_speed.normal"), "normal")
+        self.anim_speed_combo.addItem(L.t("settings.animation_speed.smooth"), "smooth")
+        self._select_combo_value(self.anim_speed_combo, self.config.get("animation_speed", "normal"))
+        anim_speed_row.addWidget(lbl_aspeed); anim_speed_row.addWidget(self.anim_speed_combo)
+        layout.addLayout(anim_speed_row)
+
+        anim_hint = QLabel(L.t("settings.animations_hint"))
+        anim_hint.setWordWrap(True)
+        anim_hint.setStyleSheet("color: #666666; font-size: 11px;")
+        layout.addWidget(anim_hint)
+
+        self.animations_cb.toggled.connect(self._update_animation_controls)
+        self._update_animation_controls(self.animations_cb.isChecked())
 
         layout.addSpacing(10)
         sec4 = QLabel(L.t("settings.section.language")); sec4.setObjectName("SectionTitle"); layout.addWidget(sec4)
@@ -1885,6 +2203,32 @@ class SettingsDialog(QDialog):
         s = QPushButton(L.t("settings.save")); s.clicked.connect(self._save)
         btns.addWidget(r); btns.addStretch(); btns.addWidget(c2); btns.addWidget(s)
         outer.addLayout(btns)
+
+    @staticmethod
+    def _select_combo_value(combo, value):
+        for i in range(combo.count()):
+            if combo.itemData(i) == value:
+                combo.setCurrentIndex(i)
+                return
+
+    def _update_animation_controls(self, enabled):
+        self.anim_style_combo.setEnabled(bool(enabled))
+        self.anim_speed_combo.setEnabled(bool(enabled))
+
+    def _browse_button(self, slot):
+        """Compact icon button used to pick a folder next to a path field."""
+        btn = QPushButton("…")
+        btn.setObjectName("Compact")
+        btn.setFixedSize(45, 39)
+        btn.setToolTip(L.t("settings.browse"))
+        btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        icon = get_icon("folder", 16)
+        if icon:
+            btn.setIcon(icon)
+            btn.setIconSize(QSize(16, 16))
+            btn.setText("")
+        btn.clicked.connect(slot)
+        return btn
 
     def _browse(self):
         d = QFileDialog.getExistingDirectory(self, L.t("settings.games_dir"))
@@ -1946,6 +2290,9 @@ class SettingsDialog(QDialog):
             self.start_collapsed.setChecked(False)
             self.auto_steam.setChecked(True)
             self.check_updates.setChecked(True)
+            self.animations_cb.setChecked(True)
+            self._select_combo_value(self.anim_style_combo, "slide")
+            self._select_combo_value(self.anim_speed_combo, "normal")
             self.steam_input.setText(str(find_steam_path() or ""))
             for i in range(self.lang_combo.count()):
                 if self.lang_combo.itemData(i) == "en":
@@ -1960,13 +2307,16 @@ class SettingsDialog(QDialog):
         self.config["auto_steam_import"] = self.auto_steam.isChecked()
         self.config["steam_path"] = self.steam_input.text().strip()
         self.config["check_updates"] = self.check_updates.isChecked()
+        self.config["animations"] = self.animations_cb.isChecked()
+        self.config["animation_style"] = self.anim_style_combo.currentData() or "slide"
+        self.config["animation_speed"] = self.anim_speed_combo.currentData() or "normal"
         self.config["language"] = self.lang_combo.currentData()
         save_json(CONFIG_PATH, self.config)
         self.settings_applied.emit(self.config)
         self.accept()
 
 
-class AboutDialog(QDialog):
+class AboutDialog(FadeInDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle(L.t("about.title"))
@@ -2050,7 +2400,7 @@ class SteamScanThread(QThread):
             self.scanned.emit([], str(e))
 
 
-class SteamImportDialog(QDialog):
+class SteamImportDialog(FadeInDialog):
     """Lists installed Steam games and lets the user add them to the library."""
 
     def __init__(self, steam_path, existing_keys, parent=None):
@@ -2343,7 +2693,7 @@ def dialog_logo_label(size=52):
     return label
 
 
-class UpdateCheckDialog(QDialog):
+class UpdateCheckDialog(FadeInDialog):
     """Small non-modal dialog shown while the launcher checks GitHub."""
 
     def __init__(self, parent=None):
@@ -2395,7 +2745,7 @@ def _notes_plain_text(raw: str) -> str:
     return text.strip() or "—"
 
 
-class UpdateInfoDialog(QDialog):
+class UpdateInfoDialog(FadeInDialog):
     """Styled message dialog for update checks (up to date, errors)."""
 
     def __init__(self, title, message, detail="", primary_text=None, retry=False,
@@ -2455,7 +2805,7 @@ class UpdateInfoDialog(QDialog):
         self.accept()
 
 
-class UpdateDialog(QDialog):
+class UpdateDialog(FadeInDialog):
     """Shows release notes and downloads the new build."""
 
     install_requested = pyqtSignal(str)
@@ -2663,97 +3013,47 @@ class LibraryPage(QWidget):
     folder_requested = pyqtSignal()
     steam_requested = pyqtSignal()
 
-    def __init__(self, config, favorites_getter, play_times_getter, page_title, show_tools=True):
+    def __init__(self, config, favorites_getter, play_times_getter, launch_counts_getter, page_title, show_tools=True):
         super().__init__()
         self.config = config
         self.favorites_getter = favorites_getter
         self.play_times_getter = play_times_getter
+        self.launch_counts_getter = launch_counts_getter
         self.current_manifests = {}
         self.card_widgets = {}
+        self._layout_order = []
+        self._layout_sig = None
+        self._relayout_timer = QTimer(self)
+        self._relayout_timer.setSingleShot(True)
+        self._relayout_timer.setInterval(50)
+        self._relayout_timer.timeout.connect(self._apply_layout)
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(40, 35, 40, 35)
-        layout.setSpacing(15)
-
-        header = QHBoxLayout()
-        header.setSpacing(8)
-        title = QLabel(page_title)
-        title.setObjectName("PageTitle")
-        header.addWidget(title)
-        header.addStretch()
+        layout.setContentsMargins(40, 30, 40, 26)
+        layout.setSpacing(14)
 
         tool_style = """
             QPushButton {
                 background-color: #0F0F0F; color: #CCCCCC;
-                border: 1px solid #1A1A1A; border-radius: 8px;
-                padding: 8px 12px; font-size: 12px;
+                border: 1px solid #1A1A1A; border-radius: 9px;
+                padding: 8px 14px; font-size: 12px;
             }
-            QPushButton:hover { background-color: #1A1A1A; color: #FFFFFF; }
+            QPushButton:hover { background-color: #1C1C1C; color: #FFFFFF; border-color: #2E2E2E; }
+            QPushButton:pressed { background-color: #262626; }
         """
 
-        self.add_btn = QPushButton(L.t("library.add_game"))
-        self.add_btn.setStyleSheet(tool_style)
-        self.add_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.add_btn.setToolTip(L.t("dialog.add.filter"))
-        self.add_btn.clicked.connect(self.add_requested)
-        self.add_btn.setVisible(show_tools)
-        header.addWidget(self.add_btn)
+        # --- top row: title + live count + refresh ----------------------
+        header = QHBoxLayout()
+        header.setSpacing(12)
 
-        self.folder_btn = QPushButton("＋")
-        self.folder_btn.setFixedSize(38, 36)
-        folder_icon = get_icon("folder", 16)
-        if folder_icon:
-            self.folder_btn.setIcon(folder_icon)
-            self.folder_btn.setIconSize(QSize(16, 16))
-            self.folder_btn.setText("")
-        self.folder_btn.setStyleSheet(tool_style + "QPushButton { font-size: 17px; padding: 0; }")
-        self.folder_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.folder_btn.setToolTip(L.t("library.add_folder"))
-        self.folder_btn.clicked.connect(self.folder_requested)
-        self.folder_btn.setVisible(show_tools)
-        header.addWidget(self.folder_btn)
+        title = QLabel(page_title)
+        title.setObjectName("PageTitle")
+        header.addWidget(title)
 
-        self.steam_btn = QPushButton(L.t("library.steam"))
-        self.steam_btn.setStyleSheet(tool_style)
-        self.steam_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.steam_btn.setToolTip(L.t("steam.title"))
-        self.steam_btn.clicked.connect(self.steam_requested)
-        self.steam_btn.setVisible(show_tools)
-        header.addWidget(self.steam_btn)
-
-        self.search = QLineEdit()
-        self.search.setPlaceholderText(L.t("library.search_placeholder"))
-        self.search.setFixedWidth(190)
-        self.search.setStyleSheet("""
-            QLineEdit {
-                background-color: #0F0F0F; color: #FFFFFF;
-                border: 1px solid #1A1A1A; border-radius: 8px;
-                padding: 8px 14px; font-size: 12px;
-            }
-            QLineEdit:focus { border: 1px solid #333333; }
-        """)
-        search_icon = get_icon("search", 16)
-        if search_icon:
-            self.search.addAction(search_icon, QLineEdit.ActionPosition.LeadingPosition)
-        self.search.textChanged.connect(lambda: self.render(self.current_manifests))
-        header.addWidget(self.search)
-
-        self.sort_combo = QComboBox()
-        self.sort_combo.addItem(L.t("library.sort.name"))
-        self.sort_combo.addItem(L.t("library.sort.size"))
-        self.sort_combo.addItem(L.t("library.sort.date"))
-        self.sort_combo.addItem(L.t("library.sort.time"))
-        self.sort_combo.addItem(L.t("library.sort.favorites"))
-        self.sort_combo.setStyleSheet("""
-            QComboBox {
-                background-color: #0F0F0F; color: #CCCCCC;
-                border: 1px solid #1A1A1A; border-radius: 8px;
-                padding: 8px 14px; font-size: 12px;
-            }
-            QComboBox::drop-down { border: none; width: 20px; }
-        """)
-        self.sort_combo.currentIndexChanged.connect(lambda: self.render(self.current_manifests))
-        header.addWidget(self.sort_combo)
+        self.status = QLabel("")
+        self.status.setStyleSheet("color: #6E6E6E; font-size: 11px; padding-bottom: 5px;")
+        header.addWidget(self.status, alignment=Qt.AlignmentFlag.AlignBottom)
+        header.addStretch()
 
         self.refresh_btn = QPushButton()
         self.refresh_btn.setFixedSize(38, 38)
@@ -2764,20 +3064,82 @@ class LibraryPage(QWidget):
             self.refresh_btn.setIconSize(QSize(18, 18))
         else:
             self.refresh_btn.setText("↻")
-        self.refresh_btn.setStyleSheet("""
-            QPushButton {
-                background-color: #0F0F0F; color: #AAAAAA;
-                border: 1px solid #1A1A1A; border-radius: 8px;
-                font-size: 16px;
-            }
-            QPushButton:hover { background-color: #1A1A1A; color: #FFFFFF; }
-        """)
+        self.refresh_btn.setStyleSheet(tool_style)
         header.addWidget(self.refresh_btn)
         layout.addLayout(header)
 
-        self.status = QLabel("")
-        self.status.setStyleSheet("color: #777777; font-size: 11px;")
-        layout.addWidget(self.status)
+        # --- second row: actions on the left, search/sort on the right ---
+        toolbar_row = QHBoxLayout()
+        toolbar_row.setSpacing(8)
+
+        self.add_btn = QPushButton(L.t("library.add_game"))
+        self.add_btn.setStyleSheet(tool_style)
+        self.add_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.add_btn.setToolTip(L.t("dialog.add.filter"))
+        self.add_btn.clicked.connect(self.add_requested)
+        self.add_btn.setVisible(show_tools)
+        toolbar_row.addWidget(self.add_btn)
+
+        self.folder_btn = QPushButton("＋")
+        self.folder_btn.setFixedSize(38, 36)
+        folder_icon = get_icon("folder", 16)
+        if folder_icon:
+            self.folder_btn.setIcon(folder_icon)
+            self.folder_btn.setIconSize(QSize(16, 16))
+            self.folder_btn.setText("")
+        self.folder_btn.setStyleSheet(tool_style + "QPushButton { font-size: 16px; padding: 0; }")
+        self.folder_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.folder_btn.setToolTip(L.t("library.add_folder"))
+        self.folder_btn.clicked.connect(self.folder_requested)
+        self.folder_btn.setVisible(show_tools)
+        toolbar_row.addWidget(self.folder_btn)
+
+        self.steam_btn = QPushButton(L.t("library.steam"))
+        self.steam_btn.setStyleSheet(tool_style)
+        self.steam_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.steam_btn.setToolTip(L.t("steam.title"))
+        self.steam_btn.clicked.connect(self.steam_requested)
+        self.steam_btn.setVisible(show_tools)
+        toolbar_row.addWidget(self.steam_btn)
+
+        toolbar_row.addStretch()
+
+        self.search = QLineEdit()
+        self.search.setPlaceholderText(L.t("library.search_placeholder"))
+        self.search.setFixedWidth(230)
+        self.search.setStyleSheet("""
+            QLineEdit {
+                background-color: #0F0F0F; color: #FFFFFF;
+                border: 1px solid #1A1A1A; border-radius: 9px;
+                padding: 8px 14px; font-size: 12px;
+            }
+            QLineEdit:focus { border: 1px solid #3A3A3A; background-color: #121212; }
+        """)
+        search_icon = get_icon("search", 16)
+        if search_icon:
+            self.search.addAction(search_icon, QLineEdit.ActionPosition.LeadingPosition)
+        self.search.textChanged.connect(lambda: self.render(self.current_manifests))
+        toolbar_row.addWidget(self.search)
+
+        self.sort_combo = QComboBox()
+        self.sort_combo.addItem(L.t("library.sort.name"))
+        self.sort_combo.addItem(L.t("library.sort.size"))
+        self.sort_combo.addItem(L.t("library.sort.date"))
+        self.sort_combo.addItem(L.t("library.sort.time"))
+        self.sort_combo.addItem(L.t("library.sort.favorites"))
+        self.sort_combo.setMinimumWidth(160)
+        self.sort_combo.setStyleSheet("""
+            QComboBox {
+                background-color: #0F0F0F; color: #CCCCCC;
+                border: 1px solid #1A1A1A; border-radius: 9px;
+                padding: 8px 14px; font-size: 12px;
+            }
+            QComboBox:hover { border-color: #2E2E2E; }
+            QComboBox::drop-down { border: none; width: 22px; }
+        """)
+        self.sort_combo.currentIndexChanged.connect(lambda: self.render(self.current_manifests))
+        toolbar_row.addWidget(self.sort_combo)
+        layout.addLayout(toolbar_row)
 
         self.scroll = QScrollArea()
         self.scroll.setWidgetResizable(True)
@@ -2791,15 +3153,56 @@ class LibraryPage(QWidget):
         self.grid.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
 
         self.scroll.setWidget(self.grid_host)
-        layout.addWidget(self.scroll)
+        layout.addWidget(self.scroll, stretch=1)
+
+        # Centred "empty" overlay, shown instead of the grid when there is
+        # nothing to display.  Kept out of the grid so it can be centred both
+        # horizontally and vertically regardless of the column count.
+        self.empty_host = QWidget()
+        self.empty_host.setStyleSheet("background: transparent;")
+        el = QVBoxLayout(self.empty_host)
+        el.setContentsMargins(0, 0, 0, 0)
+        el.setSpacing(16)
+        el.addStretch(1)
+
+        self.empty_logo = QLabel()
+        self.empty_logo.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        logo_path = ICON_DIR / "logo.png"
+        if logo_path.exists():
+            pm = QPixmap(str(logo_path))
+            if not pm.isNull():
+                self.empty_logo.setPixmap(pm.scaled(64, 64, Qt.AspectRatioMode.KeepAspectRatio,
+                                                    Qt.TransformationMode.SmoothTransformation))
+        if self.empty_logo.pixmap().isNull():
+            self.empty_logo.setText("✦")
+            self.empty_logo.setStyleSheet("color: #2E2E2E; font-size: 44px;")
+        el.addWidget(self.empty_logo, alignment=Qt.AlignmentFlag.AlignCenter)
+
+        self._empty_message = L.t("library.empty")
+        self.empty_label = QLabel(self._empty_message)
+        self.empty_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.empty_label.setStyleSheet("color: #4A4A4A; font-size: 13px; line-height: 20px;")
+        el.addWidget(self.empty_label, alignment=Qt.AlignmentFlag.AlignCenter)
+        el.addStretch(1)
+
+        self.empty_host.setVisible(False)
+        layout.addWidget(self.empty_host, stretch=1)
 
     def show_skeleton(self):
         while self.grid.count():
             it = self.grid.takeAt(0)
             if it.widget(): it.widget().deleteLater()
-        for i in range(6):
-            r, c = divmod(i, self._columns())
-            self.grid.addWidget(SkeletonCard(), r, c)
+        cols = self._columns()
+        spacing = self.grid.spacing()
+        margins = self.grid.contentsMargins()
+        available = max(320, self.scroll.viewport().width() - margins.left() - margins.right())
+        card_width = max(190, (available - spacing * (cols - 1)) // cols)
+        height = CARD_HEIGHT
+        for i in range(min(8, cols * 2)):
+            r, c = divmod(i, cols)
+            skeleton = SkeletonCard()
+            skeleton.setFixedSize(card_width, height)
+            self.grid.addWidget(skeleton, r, c)
 
     def _columns(self):
         w = self.scroll.viewport().width() if hasattr(self, 'scroll') else 800
@@ -2812,18 +3215,23 @@ class LibraryPage(QWidget):
             it = self.grid.takeAt(0)
             if it.widget(): it.widget().deleteLater()
         self.card_widgets.clear()
+        self._layout_order = []
+        self._layout_sig = None
 
         if not manifests:
-            empty = QLabel(L.t("library.empty"))
-            empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            empty.setStyleSheet("color: #333333; font-size: 13px; padding: 60px;")
-            self.grid.addWidget(empty, 0, 0, 1, 3)
+            self.empty_label.setText(self._empty_message)
+            self.empty_host.setVisible(True)
+            self.scroll.setVisible(False)
             self.status.setText("")
             return
+
+        self.empty_host.setVisible(False)
+        self.scroll.setVisible(True)
 
         query = self.search.text().strip().lower()
         favorites = set(self.favorites_getter())
         play_times = self.play_times_getter()
+        launch_counts = self.launch_counts_getter()
 
         items = []
         for key, meta in manifests.items():
@@ -2845,31 +3253,76 @@ class LibraryPage(QWidget):
             items.sort(key=lambda x: (x[0] not in favorites, x[1].get("name", "").lower()))
 
         show_ext = self.config.get("show_extensions", False)
-        cols = self._columns()
 
-        for i, (key, meta) in enumerate(items):
-            r, c = divmod(i, cols)
+        # Build every card once.  Layout (columns + widths) is applied
+        # separately in _apply_layout so a window resize never rebuilds them.
+        for key, meta in items:
             card = GameCard(key, meta, is_favorite=key in favorites,
-                            show_ext=show_ext, play_time=play_times.get(key, 0))
+                            show_ext=show_ext, play_time=play_times.get(key, 0),
+                            launch_count=launch_counts.get(key, 0))
             card.play_requested.connect(self.play_requested)
             card.context_menu_requested.connect(self.context_requested)
             card.favorite_toggled.connect(self.favorite_toggled)
-            self.grid.addWidget(card, r, c)
             self.card_widgets[key] = card
+            self._layout_order.append(key)
+
+        self._layout_sig = None
+        self._apply_layout()
+
+        if ANIM.enabled():
+            for i, key in enumerate(self._layout_order[:24]):
+                fade_in_widget(self.card_widgets[key], 300, delay=min(260, i * 26), start=0.0)
 
         self.status.setText(L.t("library.found", count=len(items)))
 
+    def _apply_layout(self):
+        """(Re)position existing cards for the current viewport width.
+
+        Cheap: it only re-adds the already-built widgets to the grid and
+        resizes them in place.  Returns immediately when nothing changed,
+        so repeated resize events (window drag, sidebar collapse) are free.
+        """
+        if not self._layout_order:
+            return
+        cols = self._columns()
+        spacing = self.grid.spacing()
+        margins = self.grid.contentsMargins()
+        available = max(320, self.scroll.viewport().width() - margins.left() - margins.right())
+        card_width = max(190, (available - spacing * (cols - 1)) // cols)
+
+        sig = (cols, card_width, len(self._layout_order))
+        if sig == self._layout_sig:
+            return
+        self._layout_sig = sig
+
+        for i, key in enumerate(self._layout_order):
+            r, c = divmod(i, cols)
+            card = self.card_widgets.get(key)
+            if card is None:
+                continue
+            card.set_card_width(card_width)
+            self.grid.addWidget(card, r, c)
+
     def resizeEvent(self, event):
         super().resizeEvent(event)
-        if self.current_manifests:
-            QTimer.singleShot(50, lambda: self.render(self.current_manifests))
+        # Debounced: many resize events collapse into a single relayout.
+        self._relayout_timer.start()
+
+    def set_empty_message(self, text):
+        self._empty_message = text
+        self.empty_label.setText(text)
 
     def set_card_progress(self, key, visible, value=0):
         card = self.card_widgets.get(key)
         if card:
             card.progress.setVisible(visible)
             if visible:
-                card.progress.setValue(value)
+                card.set_progress_value(value)
+
+    def update_card_stats(self, key, play_time=None, launch_count=None):
+        card = self.card_widgets.get(key)
+        if card:
+            card.update_stats(play_time=play_time, launch_count=launch_count)
 
 
 class LauncherWindow(QMainWindow):
@@ -2878,7 +3331,7 @@ class LauncherWindow(QMainWindow):
         self.config = load_json(CONFIG_PATH, DEFAULT_CONFIG)
         self.cache = load_json(CACHE_PATH, {})
         self.external = load_json(LIBRARY_PATH, {})
-        self.stats = load_json(STATS_PATH, {"play_times": {}})
+        self.stats = load_json(STATS_PATH, {"play_times": {}, "launch_counts": {}})
         self.manifests = {}
         self.cover_pool = QThreadPool()
         self.scanner = None
@@ -2895,9 +3348,17 @@ class LauncherWindow(QMainWindow):
         self.active_process = None
         self.active_game_key = None
         self.game_start_time = None
+        self.game_start_pid = None
+        self._ext_timer = None
+        self._ext_baseline = None
+        self._ext_started = False
         self.temp_dir = None
         self.current_page = None
         self._initialized = False
+        self._shown_once = False
+        self._page_animations = None
+
+        ANIM.configure(self.config)
 
         self.setWindowTitle(L.t("app.title"))
         self.setWindowIcon(QApplication.windowIcon())
@@ -2912,10 +3373,6 @@ class LauncherWindow(QMainWindow):
 
         if self.config.get("sidebar_collapsed", False):
             QTimer.singleShot(120, self.sidebar.toggle)
-
-        self.home_page.setVisible(False)
-        self.library_page.setVisible(False)
-        self.fav_page.setVisible(False)
 
         QTimer.singleShot(50, self._post_show_init)
 
@@ -2971,11 +3428,16 @@ class LauncherWindow(QMainWindow):
         self.content_layout.setContentsMargins(0, 0, 0, 0)
         self.content_layout.setSpacing(0)
 
+        self.page_stack = QStackedWidget()
+        self.page_stack.setStyleSheet("QStackedWidget { background: transparent; border: none; }")
+        self.page_stack.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, False)
+
         self.home_page = HomePage()
         self.library_page = LibraryPage(
             self.config,
             favorites_getter=lambda: self.config.get("favorites", []),
             play_times_getter=lambda: self.stats.get("play_times", {}),
+            launch_counts_getter=lambda: self.stats.get("launch_counts", {}),
             page_title=L.t("library.title")
         )
         self.library_page.refresh_btn.clicked.connect(self.refresh_library)
@@ -2990,17 +3452,20 @@ class LauncherWindow(QMainWindow):
             self.config,
             favorites_getter=lambda: self.config.get("favorites", []),
             play_times_getter=lambda: self.stats.get("play_times", {}),
+            launch_counts_getter=lambda: self.stats.get("launch_counts", {}),
             page_title=L.t("sidebar.favorites"),
             show_tools=False
         )
+        self.fav_page.set_empty_message(L.t("favorites.empty"))
         self.fav_page.refresh_btn.clicked.connect(self.refresh_library)
         self.fav_page.play_requested.connect(self.play_by_key)
         self.fav_page.context_requested.connect(self.show_context_menu)
         self.fav_page.favorite_toggled.connect(self.toggle_favorite)
 
-        self.content_layout.addWidget(self.home_page)
-        self.content_layout.addWidget(self.library_page)
-        self.content_layout.addWidget(self.fav_page)
+        self.page_stack.addWidget(self.home_page)
+        self.page_stack.addWidget(self.library_page)
+        self.page_stack.addWidget(self.fav_page)
+        self.content_layout.addWidget(self.page_stack)
 
         main.addWidget(self.sidebar)
         main.addWidget(self.content, stretch=1)
@@ -3014,7 +3479,12 @@ class LauncherWindow(QMainWindow):
         self.bottom_left = QLabel(L.t("bottom.version"))
         self.bottom_left.setStyleSheet("color: #333333; font-size: 10px; letter-spacing: 0.5px;")
         bl.addWidget(self.bottom_left)
-        bl.addSpacing(12)
+        bl.addSpacing(14)
+
+        self.bottom_stats = QLabel("")
+        self.bottom_stats.setStyleSheet("color: #3A3A3A; font-size: 10px; letter-spacing: 0.5px;")
+        bl.addWidget(self.bottom_stats)
+        bl.addSpacing(14)
 
         self.update_chip = QPushButton("")
         self.update_chip.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -3035,12 +3505,6 @@ class LauncherWindow(QMainWindow):
         bl.addWidget(self.bottom_right)
         root.addWidget(bottom)
         self._update_bottom()
-
-        self.opacity_effect = QGraphicsOpacityEffect(self.content)
-        self.content.setGraphicsEffect(self.opacity_effect)
-        self.opacity_anim = QPropertyAnimation(self.opacity_effect, b"opacity")
-        self.opacity_anim.setDuration(220)
-        self.opacity_anim.setEasingCurve(QEasingCurve.Type.InOutQuad)
 
     def _build_tray(self):
         self.tray = QSystemTrayIcon(self)
@@ -3106,17 +3570,37 @@ class LauncherWindow(QMainWindow):
         else:
             event.accept()
 
+    def showEvent(self, event):
+        super().showEvent(event)
+        if self._shown_once or not ANIM.enabled():
+            return
+        self._shown_once = True
+        duration = ANIM.duration(300)
+        if duration <= 0:
+            return
+        try:
+            self.setWindowOpacity(0.0)
+            self._window_fade = QPropertyAnimation(self, b"windowOpacity", self)
+            self._window_fade.setDuration(duration)
+            self._window_fade.setStartValue(0.0)
+            self._window_fade.setEndValue(1.0)
+            self._window_fade.setEasingCurve(QEasingCurve.Type.OutCubic)
+            self._window_fade.start()
+        except Exception:
+            self.setWindowOpacity(1.0)
+
     def switch_page(self, key, animate=True):
+        order = {"home": 0, "library": 1, "favorites": 2}
         pages = {"home": self.home_page, "library": self.library_page, "favorites": self.fav_page}
         target = pages.get(key)
-        if not target:
+        if not target or key not in order:
             return
         if key == self.current_page and self._initialized:
             return
 
+        previous_index = self.page_stack.currentIndex()
+        index = self.page_stack.indexOf(target)
         self.current_page = key
-        for k, p in pages.items():
-            p.setVisible(k == key)
 
         for k, btn in self.sidebar.nav_buttons.items():
             if k in ("settings", "about"):
@@ -3128,18 +3612,113 @@ class LauncherWindow(QMainWindow):
                 btn.blockSignals(False)
                 self.sidebar._render(btn, self.sidebar.is_collapsed)
 
-        if animate and self._initialized:
-            self.opacity_anim.stop()
-            self.opacity_anim.setStartValue(0.0)
-            self.opacity_anim.setEndValue(1.0)
-            self.opacity_anim.start()
+        if index == previous_index:
+            return
+
+        if animate and self._initialized and ANIM.enabled() and previous_index >= 0:
+            direction = 1 if index > previous_index else -1
+            self._animate_page_switch(previous_index, index, direction)
+        else:
+            self.page_stack.setCurrentIndex(index)
 
         if key in ("library", "favorites") and self._initialized:
             self.scan_library()
 
+    def _animate_page_switch(self, previous_index, index, direction=1):
+        """Slides / fades between pages for a smooth navigation feel."""
+        stack = self.page_stack
+        old_widget = stack.widget(previous_index)
+        new_widget = stack.widget(index)
+        width = stack.width()
+        height = stack.height()
+
+        snapshot = None
+        if old_widget is not None and width > 10 and height > 10:
+            try:
+                snapshot = old_widget.grab()
+            except Exception:
+                snapshot = None
+
+        stack.setCurrentIndex(index)
+        if new_widget is None or width <= 10 or height <= 10:
+            return
+
+        duration = ANIM.duration(320)
+        group = QParallelAnimationGroup(self)
+        sliding = ANIM.style == "slide"
+        offset = width * (1 if direction >= 0 else -1)
+
+        overlay = None
+        if snapshot is not None and not snapshot.isNull():
+            overlay = QLabel(stack)
+            overlay.setPixmap(snapshot)
+            overlay.setGeometry(0, 0, width, height)
+            overlay.show()
+            overlay.raise_()
+            overlay_effect = QGraphicsOpacityEffect(overlay)
+            overlay_effect.setOpacity(1.0)
+            overlay.setGraphicsEffect(overlay_effect)
+            fade_out = QPropertyAnimation(overlay_effect, b"opacity", self)
+            fade_out.setDuration(duration)
+            fade_out.setStartValue(1.0)
+            fade_out.setEndValue(0.0)
+            fade_out.setEasingCurve(QEasingCurve.Type.InOutCubic)
+            group.addAnimation(fade_out)
+            if sliding:
+                move_out = QPropertyAnimation(overlay, b"pos", self)
+                move_out.setDuration(duration)
+                move_out.setStartValue(QPoint(0, 0))
+                move_out.setEndValue(QPoint(-offset, 0))
+                move_out.setEasingCurve(QEasingCurve.Type.OutCubic)
+                group.addAnimation(move_out)
+
+        if sliding:
+            new_widget.setGeometry(0, 0, width, height)
+            new_widget.move(offset, 0)
+            move_in = QPropertyAnimation(new_widget, b"pos", self)
+            move_in.setDuration(duration)
+            move_in.setStartValue(QPoint(offset, 0))
+            move_in.setEndValue(QPoint(0, 0))
+            move_in.setEasingCurve(QEasingCurve.Type.OutCubic)
+            group.addAnimation(move_in)
+        else:
+            new_effect = QGraphicsOpacityEffect(new_widget)
+            new_effect.setOpacity(0.0)
+            new_widget.setGraphicsEffect(new_effect)
+            fade_in = QPropertyAnimation(new_effect, b"opacity", self)
+            fade_in.setDuration(duration)
+            fade_in.setStartValue(0.0)
+            fade_in.setEndValue(1.0)
+            fade_in.setEasingCurve(QEasingCurve.Type.OutCubic)
+            group.addAnimation(fade_in)
+            group.finished.connect(lambda: self._clean_page_effect(new_widget))
+
+        def cleanup():
+            if overlay is not None:
+                overlay.hide()
+                overlay.deleteLater()
+            try:
+                new_widget.move(0, 0)
+            except Exception:
+                pass
+
+        group.finished.connect(cleanup)
+        group.start()
+        self._page_animations = group
+        self._page_animation_widget = new_widget
+
+    @staticmethod
+    def _clean_page_effect(widget):
+        try:
+            widget.setGraphicsEffect(None)
+        except Exception:
+            pass
+
     def _update_bottom(self):
         t = self.config.get("temp_dir", str(CACHE_DIR))
         self.bottom_right.setText(L.t("bottom.temp", size=human_size(dir_size(t))))
+        steam_count = sum(1 for meta in self.manifests.values() if meta.get("type") == "steam")
+        self.bottom_stats.setText(L.t("bottom.stats", games=len(self.manifests), steam=steam_count))
 
     def scan_library(self):
         games_dir = self.config.get("games_dir", str(GAMES_DIR))
@@ -3329,9 +3908,12 @@ class LauncherWindow(QMainWindow):
     def play_by_key(self, key):
         if key not in self.manifests:
             return
-        if self.active_process and self.active_process.poll() is None:
-            QMessageBox.warning(self, L.t("menu.play"), L.t("launch.already_running"))
-            return
+        if self.active_game_key and self.game_start_time:
+            # A session (local or Steam/shortcut) is still running.
+            still_running = (self.active_process is None) or (self.active_process.poll() is None)
+            if still_running:
+                QMessageBox.warning(self, L.t("menu.play"), L.t("launch.already_running"))
+                return
         meta = self.manifests[key]
         if meta.get("error"):
             QMessageBox.critical(self, L.t("card.error"),
@@ -3345,6 +3927,8 @@ class LauncherWindow(QMainWindow):
             appid = str(meta.get("appid") or key.split(":")[-1])
             try:
                 launch_steam_game(appid)
+                self._register_launch(key)
+                self._start_session(key)  # no Popen handle → watch processes
                 self.library_page.status.setText(L.t("launch.steam_launch", name=name))
                 log.info(f"Запуск через Steam: {name} (appid {appid})")
             except Exception as e:
@@ -3373,7 +3957,7 @@ class LauncherWindow(QMainWindow):
             return
 
         if game_type == "shortcut":
-            self._launch_shortcut(meta)
+            self._launch_shortcut(key, meta)
             return
 
         dvp_path = meta["path"]
@@ -3412,17 +3996,16 @@ class LauncherWindow(QMainWindow):
                     [exe_path], cwd=cwd, shell=False, creationflags=flags)
             if not keep_temp:
                 self.temp_dir = None
-            self.active_game_key = key
-            self.game_start_time = time.time()
+            self._register_launch(key)
+            self._start_session(key, process=self.active_process)
             self.library_page.status.setText(L.t("launch.playing", name=name,
                                                  pid=self.active_process.pid))
             log.info(f"Запуск: {name} (PID {self.active_process.pid})")
-            QTimer.singleShot(2000, self._check_process)
         except Exception as e:
             log.exception("Ошибка запуска")
             QMessageBox.critical(self, L.t("launch.start_error"), str(e))
 
-    def _launch_shortcut(self, meta):
+    def _launch_shortcut(self, key, meta):
         target = meta.get("path", "")
         name = meta.get("name", "game")
         if not target or not os.path.exists(target):
@@ -3436,6 +4019,8 @@ class LauncherWindow(QMainWindow):
                 subprocess.Popen(["open", target])
             else:
                 subprocess.Popen(["xdg-open", target])
+            self._register_launch(key)
+            self._start_session(key)  # no Popen handle → watch processes
             self.library_page.status.setText(L.t("launch.direct", name=name))
         except Exception as e:
             log.exception("Ошибка запуска ярлыка")
@@ -3483,34 +4068,85 @@ class LauncherWindow(QMainWindow):
 
         self._launch_executable(key, exe_path, meta, keep_temp=True)
 
-    def _check_process(self):
-        if self.active_process is None:
-            return
-        if self.active_process.poll() is not None:
-            duration = time.time() - self.game_start_time if self.game_start_time else 0
-            key = self.active_game_key
-            if key and duration > 5:
-                times = self.stats.setdefault("play_times", {})
-                times[key] = times.get(key, 0) + int(duration)
-                save_json(STATS_PATH, self.stats)
-                log.info(f"Игра {key} закрыта, время сессии: {int(duration)}с")
+    def _register_launch(self, key):
+        """Count a launch for this game and refresh only its stats line."""
+        counts = self.stats.setdefault("launch_counts", {})
+        counts[key] = counts.get(key, 0) + 1
+        save_json(STATS_PATH, self.stats)
+        self.library_page.update_card_stats(key, launch_count=counts[key])
+        self.fav_page.update_card_stats(key, launch_count=counts[key])
 
-            self.library_page.status.setText(L.t("launch.closed"))
-            if self.config.get("auto_cleanup", True) and self.temp_dir and os.path.exists(self.temp_dir):
-                try:
-                    shutil.rmtree(self.temp_dir, ignore_errors=True)
-                    self.library_page.status.setText(L.t("launch.cleaned"))
-                except Exception as e:
-                    log.warning(f"Не удалось очистить: {e}")
-            self.temp_dir = None
-            self.active_process = None
-            self.active_game_key = None
-            self.game_start_time = None
-            self._update_bottom()
-            self.library_page.render(self.manifests)
-            self._render_favorites()
-        else:
-            QTimer.singleShot(2000, self._check_process)
+    def _start_session(self, key, process=None):
+        """Begin a play-time session.
+
+        When a Popen handle is available it is polled directly (accurate).
+        Otherwise (Steam / shortcuts) we fall back to watching for new
+        processes appearing and disappearing.
+        """
+        self.active_game_key = key
+        self.game_start_time = time.time()
+        self.active_process = process
+        self._ext_baseline = snapshot_pids() if process is None else None
+        self._ext_started = False
+        if not hasattr(self, "_ext_timer") or self._ext_timer is None:
+            self._ext_timer = QTimer(self)
+            self._ext_timer.setInterval(2500)
+            self._ext_timer.timeout.connect(self._poll_external_session)
+        self._ext_timer.start()
+
+    def _poll_external_session(self):
+        if self.active_process is not None:
+            # Local game: poll its handle directly.
+            if self.active_process.poll() is not None:
+                self._ext_timer.stop()
+                self._finish_session()
+            return
+
+        # Steam / shortcut: watch for a new non-noise process appearing.
+        baseline = self._ext_baseline or {}
+        current = snapshot_pids()
+        if not current:
+            return
+        new_procs = {pid: name for pid, name in current.items()
+                     if pid not in baseline and not any(n in name for n in _LAUNCH_NOISE)}
+        if new_procs:
+            self._ext_started = True
+            self._ext_baseline.update(new_procs)
+        elif self._ext_started:
+            # The game process disappeared → session over.
+            self._ext_timer.stop()
+            self._finish_session()
+
+    def _finish_session(self):
+        key = self.active_game_key
+        duration = time.time() - self.game_start_time if self.game_start_time else 0
+        if key and duration > 5:
+            times = self.stats.setdefault("play_times", {})
+            times[key] = times.get(key, 0) + int(duration)
+            save_json(STATS_PATH, self.stats)
+            self.library_page.update_card_stats(key, play_time=times[key])
+            self.fav_page.update_card_stats(key, play_time=times[key])
+            log.info(f"Игра {key} закрыта, время сессии: {int(duration)}с")
+
+        self.library_page.status.setText(L.t("launch.closed"))
+        if self.config.get("auto_cleanup", True) and self.temp_dir and os.path.exists(self.temp_dir):
+            try:
+                shutil.rmtree(self.temp_dir, ignore_errors=True)
+                self.library_page.status.setText(L.t("launch.cleaned"))
+            except Exception as e:
+                log.warning(f"Не удалось очистить: {e}")
+        self.temp_dir = None
+        self.active_process = None
+        self.active_game_key = None
+        self.game_start_time = None
+        self._ext_baseline = None
+        self._ext_started = False
+        self._update_bottom()
+
+    def _check_process(self):
+        # Back-compat shim; real work happens in _poll_external_session.
+        if self.active_process is not None and self.active_process.poll() is not None:
+            self._finish_session()
 
     # ------------------------------------------------------------------
     #  ADDING GAMES
@@ -3973,6 +4609,7 @@ class LauncherWindow(QMainWindow):
         else:
             self.library_page.config = new_conf
             self.fav_page.config = new_conf
+            ANIM.configure(self.config)
             self.scan_library()
             self._update_bottom()
             QTimer.singleShot(800, self._auto_steam_sync)
